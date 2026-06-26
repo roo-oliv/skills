@@ -5,9 +5,6 @@ pipeline plus the docs scaffolding it leans on. They're meant to be **portable**
 reads one per-repo config file instead of hardcoding a stack, so the same skill works on a
 Kotlin/Spring backend, a TypeScript/Supabase app, and a C# game engine.
 
-Inspired by [@mattpocock/skills](https://github.com/mattpocock/skills) — same "small,
-composable, model-agnostic" spirit, different skill set.
-
 ## The skills
 
 **Pipeline (the core loop):**
