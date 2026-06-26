@@ -26,7 +26,7 @@ This skill reads per-repo configuration from **`docs/agents/skills-config.md`** 
 4. Hints for the classifier:
    - Is there a deep-plan contract committed on this branch? Look under the planning path in **Docs layout** (`docs/agents/skills-config.md`), e.g. `.claude/deep-plan/*.md` (`git diff --name-only origin/main...HEAD | rg '<plan-contract glob>'`).
    - Which of the repo's **Sensitive domains** (`docs/agents/skills-config.md` › Sensitive domains) does the diff touch? Detect each changed file's domain via **Domains** (config — path-glob → domain). If no sensitive domains are listed, treat no domain as sensitive.
-   - The repo's **flows** (`docs/agents/skills-config.md` › Flows — one doc per flow under the flows dir, default `docs/flows/`). Select each flow doc whose frontmatter `covers:` globs intersect the changed files and pass them as `flows` so deep mode fans out one flow-lens agent per touched flow. If none match (or there are no flow docs), deep mode runs the universal lenses only.
+   - The repo's **flows** (`docs/agents/skills-config.md` › Flows — one doc per flow under the flows dir, default `docs/flows/`). Select each flow doc whose frontmatter `covers:` globs intersect the changed files — a flow doc with no `covers` always counts as touched (matches deep-review) — and pass them as `flows` so deep mode fans out one flow-lens agent per touched flow. If none match (or there are no flow docs), deep mode runs the universal lenses only.
    - Diff size (`gh pr diff <N> --name-only | wc -l`).
 
 ## Step 3 — Fire the workflow
