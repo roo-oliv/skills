@@ -8,6 +8,8 @@
     "./skills/deep-plan",
     "./skills/implement",
     "./skills/review-fix-loop",
-    "./skills/deep-review"
+    "./skills/deep-review",
+    "./skills/verify",
+    "./skills/verify-plan"
   ]
 }
