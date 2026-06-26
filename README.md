@@ -17,6 +17,13 @@ Kotlin/Spring backend, a TypeScript/Supabase app, and a C# game engine.
 | [`review-fix-loop`](skills/review-fix-loop) | Review → fix loop over an open PR until exhaustion: review, reconcile with what's already posted, post a consolidated review, fix, repeat. |
 | [`deep-review`](skills/deep-review) | Multi-agent review of a PR/branch/commit/local diff through a universal lens set plus one dedicated lens per flow the repo declares. Used standalone or inside `review-fix-loop`. |
 
+**Checks (used by the loop, and on their own):**
+
+| Skill | What it does |
+|---|---|
+| [`verify`](skills/verify) | Run the repo's configured format/lint/build/test pipeline (`config › Verify`) with a fix loop until it's green, then report honestly. Run after any change. |
+| [`verify-plan`](skills/verify-plan) | Reconcile an implementation against its plan — Missing (coverage) / Diverged (fidelity) / Unplanned (scope-creep). Cheap, plan-grounded; run per-commit and before a PR. Not a bug hunt. |
+
 **Setup (run once per repo):**
 
 | Skill | What it does |
