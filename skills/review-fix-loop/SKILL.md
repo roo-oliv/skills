@@ -26,7 +26,7 @@ This skill reads per-repo configuration from **`docs/agents/skills-config.md`** 
 4. Hints for the classifier:
    - Is there a deep-plan contract committed on this branch? Look under the planning path in **Docs layout** (`docs/agents/skills-config.md`), e.g. `.claude/deep-plan/*.md` (`git diff --name-only origin/main...HEAD | rg '<plan-contract glob>'`).
    - Which of the repo's **Sensitive domains** (`docs/agents/skills-config.md` › Sensitive domains) does the diff touch? Detect each changed file's domain via **Domains** (config — path-glob → domain). If no sensitive domains are listed, treat no domain as sensitive.
-   - The repo's domain **Lenses** (`docs/agents/skills-config.md` › Lenses), if any — pass them as `lenses` so deep mode fans out one domain-lens agent per entry. If absent, deep mode runs the universal lenses only.
+   - The repo's **flows** (`docs/agents/skills-config.md` › Flows — one doc per flow under the flows dir, default `docs/flows/`). Select each flow doc whose frontmatter `covers:` globs intersect the changed files and pass them as `flows` so deep mode fans out one flow-lens agent per touched flow. If none match (or there are no flow docs), deep mode runs the universal lenses only.
    - Diff size (`gh pr diff <N> --name-only | wc -l`).
 
 ## Step 3 — Fire the workflow
@@ -44,13 +44,13 @@ Call `Workflow` with `scriptPath: .claude/workflows/review-fix-loop.js` and `arg
   "modeHint": "auto | deep | standard",
   "deepPlanContractOnBranch": true,
   "sensitiveDomains": ["payout", "billing"],
-  "lenses": [{ "name": "money-flows", "brief": "trace every value end-to-end; tag base/unit/cap" }],
+  "flows": [{ "name": "payment-pipeline", "doc": "<full text of docs/flows/payment-pipeline.md>" }],
   "diffFiles": 42,
   "timestamp": "<date +%Y-%m-%dT%H-%M>"
 }
 ```
 
-`sensitiveDomains` is the subset of touched domains that the config marks sensitive (empty if none). `lenses` is the repo's domain-specific lens list copied from `docs/agents/skills-config.md` › Lenses (`[{ name, brief }]`, empty if none) — in deep mode the workflow runs the universal lenses always, plus one domain-lens agent per entry. Runs in the background; wait for the `<task-notification>`.
+`sensitiveDomains` is the subset of touched domains that the config marks sensitive (empty if none). `flows` is the set of flow docs the change touches, copied from the flows dir (`[{ name, doc }]` where `doc` is the flow doc's full text, empty if none) — in deep mode the workflow runs the universal lenses always, plus one `flow-lens` agent per flow. Runs in the background; wait for the `<task-notification>`.
 
 ## Step 4 — Report
 
@@ -74,7 +74,7 @@ The round economics come from a real audit (a 10-round, 36-Blocker/High run): 93
 - **Classify** (round 1): deep if a deep-plan contract is on the branch, OR a **Sensitive domain** (config › Sensitive domains) is touched with a lifecycle/flow change, OR a large/delicate diff (agent's judgment); otherwise standard. If no sensitive domains are configured, default to standard unless a deep-plan contract is on the branch. `modeHint` forces it.
 - **Review — round 1 and gate (breadth)**:
   - *standard* — 1 agent mirroring Anthropic's code-review action prompt (`pr-review-comprehensive`), spec in `.claude/skills/review-fix-loop/agents/standard-review.md`, all rounds (simple PRs don't pay the deep apparatus).
-  - *deep* — fan-out of the repo's deep-review lenses (`.claude/skills/deep-review/agents/*.md`): the **universal lenses** (adjacent-code, derived-quantity, negative-space, contract×code, test-coverage) plus **one domain lens per entry in config › Lenses** via deep-review's generic `domain-lens.md` mechanism + the consolidator (`consolidate.md` — demotion of Blocker/High only with evidence read in the code; fills `surface` per Blocker/High).
+  - *deep* — fan-out of the repo's deep-review lenses (`.claude/skills/deep-review/agents/*.md`): the **universal lenses** (adjacent-code, derived-quantity, negative-space, contract×code, test-coverage) plus **one flow lens per entry in config › Flows** via deep-review's generic `flow-lens.md` mechanism + the consolidator (`consolidate.md` — demotion of Blocker/High only with evidence read in the code; fills `surface` per Blocker/High).
   - Both receive the **branch's plan-contract as the current spec** (fixes from earlier rounds update the semantics they minted into it) — code↔contract divergence and a derived quantity without a dimension row are findings, which keeps the reviewer from re-deriving semantics already decided.
 - **Enumerate (every deep round with Blocker/High)**: for each hot surface (grouped by `surface`, cap `maxEnumSurfaces` default 6, Blockers first), an enumerator (`enumerate.md`) **exhausts the surface's facets in the same round** — cross-domain writers, scope complements, clock, formula legs, crash windows — with file:line evidence per facet and a `dry` verdict. It is the antidote to the one-facet-per-round pattern (one ~30-line query produced 8 Blocker/High across 8 rounds).
 - **Review — rounds 2+ (depth)**: instead of a fresh full fan-out: (1) **bounded validator** adversarially judges each fix claimed by the previous round's fixer (scope closed to the ids; `stillOpen` re-enters); (2) **fix-diff reviewer** reviews only the delta of the fixer's commits (catches fix-introduced defects with zero latency); (3) **re-enumeration** of the surfaces of the just-fixed Blocker/High (the fix narrowed the surface — that's when the next layer becomes visible).

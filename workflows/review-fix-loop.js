@@ -4,7 +4,7 @@ export const meta = {
   whenToUse: 'Invoked by the /review-fix-loop skill (.claude/skills/review-fix-loop/SKILL.md) with an open PR and its branch checked out.',
   phases: [
     { title: 'Classify', detail: 'standard (mirror of Anthropic\'s code-review action) vs deep (deep-review lenses)' },
-    { title: 'Review', detail: 'round 1/gate: breadth fan-out (universal + domain lenses); rounds 2+: bounded validator of fixes + fix-diff reviewer' },
+    { title: 'Review', detail: 'round 1/gate: breadth fan-out (universal + per-flow lenses); rounds 2+: bounded validator of fixes + fix-diff reviewer' },
     { title: 'Enumerate', detail: 'exhausts each hot surface (facets with evidence) in the same round' },
     { title: 'Conciliate', detail: 'fuses with comments/reviews already posted, dedups, posts on the PR' },
     { title: 'Fix', detail: 'addresses Blocker/High + aged Mediums, commit+push, updates the description, replies to divergences' },
@@ -31,11 +31,11 @@ const DEEP_DIR = `${ARGS.repoRoot}/.claude/skills/deep-review/agents`
 const CONFIG = 'docs/agents/skills-config.md'
 
 // Deep mode fans out the genericized deep-review lens set installed alongside this skill:
-// the UNIVERSAL lenses (always, by flat role-file name) + one DOMAIN lens per entry in
-// config › Lenses, via deep-review's generic domain-lens.md mechanism. The backend's old
-// money lenses (financial-flows / payment-pipeline / dsa-lifecycle) are now examples of
-// what config › Lenses holds, not hardcoded files. If a role file is missing on the branch,
-// the lens prompt short-circuits to {"findings": []}.
+// the UNIVERSAL lenses (always, by flat role-file name) + one FLOW lens per flow doc the
+// change touches, via deep-review's generic flow-lens.md mechanism. The repo declares its
+// flows as docs (config › Flows; the orchestrator passes the touched ones); a repo with no
+// financial (or any) flows simply passes none. If a role file is missing on the branch, the
+// lens prompt short-circuits to {"findings": []}.
 const UNIVERSAL_LENSES = [
   { key: 'adjacent', file: 'adjacent-code.md' },
   { key: 'quantity', file: 'derived-quantity.md' },
@@ -43,13 +43,13 @@ const UNIVERSAL_LENSES = [
   { key: 'contract', file: 'contract-reconciler.md' },
   { key: 'tests', file: 'test-coverage.md' },
 ]
-// Domain lenses come from the orchestrator (config › Lenses): [{ name, brief }]. Each runs the
-// generic domain-lens.md role file parameterized with its name + brief.
-const DOMAIN_LENSES = (Array.isArray(ARGS.lenses) ? ARGS.lenses : [])
-  .filter((l) => l && (l.name || l.brief))
+// Flow lenses come from the orchestrator (the touched flow docs): [{ name, doc }] where `doc`
+// is the flow doc's full text. Each runs the generic flow-lens.md role file with that doc.
+const FLOW_LENSES = (Array.isArray(ARGS.flows) ? ARGS.flows : [])
+  .filter((l) => l && (l.name || l.doc))
   .slice(0, 8)
-  .map((l, i) => ({ key: `domain-${i}`, file: 'domain-lens.md', name: String(l.name || `lens-${i}`).slice(0, 60), brief: String(l.brief || '').slice(0, 300) }))
-const DEEP_AGENTS = [...UNIVERSAL_LENSES, ...DOMAIN_LENSES]
+  .map((l, i) => ({ key: `flow-${i}`, file: 'flow-lens.md', name: String(l.name || `flow-${i}`).slice(0, 60), doc: String(l.doc || '').slice(0, 6000) }))
+const DEEP_AGENTS = [...UNIVERSAL_LENSES, ...FLOW_LENSES]
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -186,9 +186,9 @@ ${contractNote()}`
 }
 
 function deepReviewPrompt(a, round, kind) {
-  const isDomain = a.file === 'domain-lens.md'
-  const roleLine = isDomain
-    ? `Read ${DEEP_DIR}/domain-lens.md and operate as the "${a.name}" domain lens — your brief: ${a.brief || '(no brief; apply the lens name to this diff)'} (round ${round} of review-fix-loop${kind === 'gate' ? ' — exhaustion GATE: earlier rounds zeroed High/Blocker in targeted passes; you are the clean breadth look that confirms or refutes exhaustion' : ''})`
+  const isFlow = a.file === 'flow-lens.md'
+  const roleLine = isFlow
+    ? `Read ${DEEP_DIR}/flow-lens.md and operate as the "${a.name}" flow lens. Review the diff against what this flow doc says must hold:\n\n=== FLOW DOC: ${a.name} ===\n${a.doc || '(no doc text passed; apply the flow name to this diff)'}\n=== END FLOW DOC ===\n(round ${round} of review-fix-loop${kind === 'gate' ? ' — exhaustion GATE: earlier rounds zeroed High/Blocker in targeted passes; you are the clean breadth look that confirms or refutes exhaustion' : ''})`
     : `Read ${DEEP_DIR}/${a.file} and operate as that specialist (round ${round} of review-fix-loop${kind === 'gate' ? ' — exhaustion GATE: earlier rounds zeroed High/Blocker in targeted passes; you are the clean breadth look that confirms or refutes exhaustion' : ''})`
   return `${ctx()}
 

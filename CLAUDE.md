@@ -12,7 +12,7 @@ repo* (schema: `skills/setup/skills-config.template.md`). A skill must never ass
 - a build/test command (`./gradlew …`, `npm test`) → read **Verify** from config;
 - where premises/tenets live (`docs/{domain}/premises.md`) → read **Docs layout**;
 - which domains are sensitive (money, etc.) → read **Sensitive domains**;
-- a domain vocabulary or review lens → read **Domains** / **Lenses**;
+- a domain vocabulary, or which dedicated review lens to run → read **Domains** / **Flows**;
 - a commit/PR language or convention → read **Conventions**.
 
 When a skill needs one of these, it reads the config; if the section is absent, it falls back to

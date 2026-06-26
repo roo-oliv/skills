@@ -64,21 +64,34 @@ gate never blocks.
 `<domain>, <domain>`
 <!-- e.g. backend: paymentgateway, storecredit, billing, debtsettlement, cohort, payout, notary | monodreams: (none — or physics, collision if you treat correctness as load-bearing) -->
 
-## Lenses
+## Flows
 
-`deep-review` / `deep-plan` always run a **universal** lens set: adjacent-code (downstream
-callers a change forgets), derived-quantity (every computed value's base/unit/cap),
-negative-space (unhandled states/scope), contract×code (code vs the plan/premises it claims
-to satisfy), test-coverage (premises no test protects). List **additional domain-specific
-lenses** this repo wants — one line each, `name: what it checks`. Optional.
+`deep-review` / `deep-plan` always run a **universal** lens set, stack-agnostic by design:
+adjacent-code (downstream callers a change forgets), derived-quantity (every computed value's
+base/unit/cap), negative-space (unhandled states/scope), contract×code (code vs the plan/premises
+it claims to satisfy), test-coverage (premises no test protects).
 
-- `<lens-name>`: `<what it checks, in one line>`
-<!-- e.g. backend:
-       money-flows: trace every cents value end-to-end; tag its base (face/residual/principal) and cap; flag uncapped settle amounts.
-       dsa-lifecycle: a new status/RESERVED record × every adjacent entity event (DSA create/cancel, charge cancel, overpayment, payout run).
-     monodreams:
-       ecs-purity: components are pure data; logic lives in systems; flag methods on components.
-       system-ordering: a system reading state another writes the same frame — ordering/one-frame-lag bugs. -->
+On top of those, the review spawns **one dedicated lens per *flow* this repo declares**. A flow
+is a path that data/state/money takes through the system that must be reasoned about as a whole
+— a payment pipeline, a level-load sequence, an auth handshake. You document each one as a
+markdown file that reads like a **dedicated core-tenet for that flow**: descriptive (not review
+instructions), but carrying everything a reviewer or planner needs — the path, the entities and
+their lifecycle, the invariants, the load-bearing quantities, the failure modes. The flow lens
+turns that doc into review questions against the diff. This is how the skills get repo-specific
+without anything being hardcoded: a repo with no financial flows simply declares none.
+
+- **Flows dir:** `<dir>`  <!-- default: docs/flows/ ; one `<flow>.md` per flow -->
+
+Author flow docs with the `bootstrap` skill (or by hand) using the format in
+[bootstrap/flow.template.md](../bootstrap/flow.template.md). Each doc's frontmatter `covers:`
+globs decide which flows a given change touches — only those flows' lenses run. No flows dir, or
+no flow docs → only the universal lenses run.
+<!-- e.g. backend: docs/flows/{payment-pipeline,settlement,dsa-lifecycle,payout}.md
+     monodreams: docs/flows/{level-load,collision-resolution,render-pass}.md
+     a repo with no load-bearing flows: none — the universal lenses are enough. -->
+
+(There is no separate "sensitive lens" list — sensitivity is the **Sensitive domains** axis above,
+which decides heavy-vs-light + the gate; flows decide *which dedicated lenses* run.)
 
 ## Conventions
 

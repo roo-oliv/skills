@@ -13,13 +13,13 @@ Perform a thorough code review. Accepts flexible input:
 
 Append `cheaper` (aliases: `cheap`, `simple`, `eco`, `economy`) to use tiered model routing for token efficiency. Default is all-Opus.
 
-This skill reads per-repo configuration from `docs/agents/skills-config.md` (written by the `setup` skill) — stack, verify command, docs layout, domains, sensitive domains, lenses, conventions. It hardcodes nothing stack-specific; where a needed section is absent it falls back to a stated default and says so in its output.
+This skill reads per-repo configuration from `docs/agents/skills-config.md` (written by the `setup` skill) — stack, verify command, docs layout, domains, sensitive domains, flows, conventions. It hardcodes nothing stack-specific; where a needed section is absent it falls back to a stated default and says so in its output.
 
 ---
 
 ## Model Routing
 
-The review fans out one agent per **lens**. The universal lenses always run; the repo's domain lenses (`docs/agents/skills-config.md` › Lenses) each run as one `domain-lens` agent. Below, "universal lens" rows are fixed; the domain-lens row applies per configured lens.
+The review fans out one agent per **lens**. The universal lenses always run; each **flow** the change touches (`docs/agents/skills-config.md` › Flows — one doc per flow) runs as one `flow-lens` agent. Below, "universal lens" rows are fixed; the flow-lens row applies per touched flow doc.
 
 **Default (full):** All phases and agents use **Opus** with extended thinking.
 
@@ -32,7 +32,7 @@ The review fans out one agent per **lens**. The universal lenses always run; the
 | Universal — Negative Space | **Sonnet** (extended thinking) | Structured complement checklists |
 | Universal — Contract × Code | **Sonnet** | Mechanical contract↔code diffing |
 | Universal — Test Coverage & Premises | **Sonnet** | Semi-structured gap analysis |
-| Domain lens (per config › Lenses) | **Opus** (extended thinking) | Deep, repo-specific multi-stage reasoning |
+| Flow lens (per touched flow doc) | **Opus** (extended thinking) | Deep, repo-specific multi-stage reasoning |
 
 Consolidation (Phase 3), facet enumeration (Phase 3.5) and adversarial verification (Phase 3.75) always use **Opus** regardless of mode.
 
@@ -116,7 +116,7 @@ Get stats: `git show --stat <SHA>`
 
 ## Phase 1: Context Gathering
 
-Read the repo config first: **`docs/agents/skills-config.md`** — it supplies the docs layout, domain map, sensitive domains, lens list, and conventions used below. If the file is absent, proceed with the defaults noted at each step and say so in the review header.
+Read the repo config first: **`docs/agents/skills-config.md`** — it supplies the docs layout, domain map, sensitive domains, flows dir, and conventions used below. If the file is absent, proceed with the defaults noted at each step and say so in the review header.
 
 1. **Diff and metadata**: Collected in Phase 0 above. For PR mode, also get title, description, file list. Do NOT read existing PR comments or reviews.
 
@@ -148,17 +148,18 @@ Launch **all lens agents in a single message** (parallel Agent calls). Each agen
 
 These five are the lens model the whole pipeline depends on: the universal failure shapes that are not specific to any domain — an un-enumerated cross-domain writer of a derived quantity, the complement of a poller's scope, and a code↔contract contradiction that is a note in everyone's prompt and therefore nobody's job.
 
-**Domain lenses (one per config › Lenses entry):**
+**Flow lenses (one per flow doc the change touches):**
 
-For each entry under `docs/agents/skills-config.md` › Lenses, spawn one agent that reads `.claude/skills/deep-review/agents/domain-lens.md` and is told its lens name + one-line brief. If config lists no domain lenses (or has no Lenses section), spawn none — the universal set runs alone. (Example domain lenses a money repo might configure: `money-flows`, `dsa-lifecycle`, `payment-pipeline` — trace each value end-to-end / walk each lifecycle / enumerate every settlement writer. These are illustrations of what the Lenses section contains, not a fixed set.)
+Read the **Flows dir** (`docs/agents/skills-config.md` › Flows; default `docs/flows/`). For each flow doc whose frontmatter `covers:` globs intersect the changed files — or every flow doc, if a doc has no `covers` or the change is broad — spawn one agent that reads `.claude/skills/deep-review/agents/flow-lens.md` and is given that flow's doc (path + content) as its spec. If there is no flows dir or no matching flow doc, spawn none — the universal set runs alone. (A money repo's `docs/flows/` might hold `payment-pipeline.md`, `dsa-lifecycle.md`, `payout.md`; a game engine's might hold `level-load.md`, `collision-resolution.md`. The flow doc, not this skill, carries the domain knowledge.)
 
 The Contract × Code lens short-circuits to `_No findings._` when the branch carries no plan-contract — it costs almost nothing on un-planned changes.
 
-For each agent: launch with `subagent_type: general-purpose`. In Economy mode set `model: opus` or `model: sonnet` per the routing table (domain lenses default to Opus); in Full mode all use Opus. The prompt template is:
+For each agent: launch with `subagent_type: general-purpose`. In Economy mode set `model: opus` or `model: sonnet` per the routing table (flow lenses default to Opus); in Full mode all use Opus. The prompt template is:
 
 > Read `.claude/skills/deep-review/agents/<role-file>.md` and operate as that
-> specialist. [For a domain lens, also: You are the `<lens-name>` lens; your
-> brief is `<one-line brief from config › Lenses>`.] Apply your role to the
+> specialist. [For a flow lens, also: You are the `<flow>` lens; your flow doc
+> follows — review the diff against what it says must hold:\n`<flow doc content>`.]
+> Apply your role to the
 > Phase 1 context provided below. You have full file-access tools (Read, Grep,
 > Bash) — use them liberally; scope `rg` to the repo.
 >

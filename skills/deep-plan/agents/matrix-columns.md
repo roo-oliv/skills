@@ -26,8 +26,8 @@ never to substitute for them.
 The matrix has **rows = each new status/state** the intent introduces and
 **columns = each distinct site whose behavior depends on that state**. A column
 is not a generic lifecycle event from a fixed list — it is a *real reader or
-transition site* you found in the code. The repo's configured **Lenses**
-(`docs/agents/skills-config.md` › Lenses) name the adjacent-event vocabulary for
+transition site* you found in the code. The repo's **flow docs**
+(`docs/agents/skills-config.md` › Flows) name the adjacent-event vocabulary for
 this domain; that generic set is the **floor**, and the load-bearing columns are
 the ones it omits.
 

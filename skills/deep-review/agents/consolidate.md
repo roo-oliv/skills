@@ -1,7 +1,7 @@
 # Helper — Consolidator
 
 You are receiving the markdown outputs of the lens agents (universal + any
-domain lenses) plus a summary of Phase 1 context. Your job is to produce **one**
+flow lenses) plus a summary of Phase 1 context. Your job is to produce **one**
 consolidated review document, deduplicated and severity-classified.
 
 ## Step 1: Deduplicate

@@ -20,8 +20,8 @@ state.
 ## The lifecycle (config-driven)
 
 The lifecycle stages of the affected entity come from the repo's domain — read
-them from the premises and schema docs and the configured **Lenses**
-(`docs/agents/skills-config.md` › Lenses). The backend's canonical example is a
+them from the premises and schema docs and the **flow docs**
+(`docs/agents/skills-config.md` › Flows). The backend's canonical example is a
 debt-settlement agreement: *creation → installment payment → renegotiation →
 expiration → manual cancellation → born-PAID*, with a reconciliation invariant
 that relaxes only between creation and first payment (originals SUPERSEDED,

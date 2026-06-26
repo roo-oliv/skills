@@ -15,20 +15,20 @@ Kotlin/Spring backend, a TypeScript/Supabase app, and a C# game engine.
 | [`deep-plan`](skills/deep-plan) | Fill and adversarially refute a plan's contract (interaction matrix, dimension table, precondition diff) against the live codebase, before code exists. Engages for changes in sensitive domains. |
 | [`implement`](skills/implement) | Implement an approved plan end-to-end into an open PR — wave-based, a fresh agent per wave plus a persistent ledger, verify + reconcile at the end. |
 | [`review-fix-loop`](skills/review-fix-loop) | Review → fix loop over an open PR until exhaustion: review, reconcile with what's already posted, post a consolidated review, fix, repeat. |
-| [`deep-review`](skills/deep-review) | Multi-agent review of a PR/branch/commit/local diff through a universal lens set plus the repo's own domain lenses. Used standalone or inside `review-fix-loop`. |
+| [`deep-review`](skills/deep-review) | Multi-agent review of a PR/branch/commit/local diff through a universal lens set plus one dedicated lens per flow the repo declares. Used standalone or inside `review-fix-loop`. |
 
 **Setup (run once per repo):**
 
 | Skill | What it does |
 |---|---|
-| [`setup`](skills/setup) | Write `docs/agents/skills-config.md` — the file every other skill reads. Interviews you about stack, verify command, docs layout, domains, sensitive domains, lenses, conventions. |
+| [`setup`](skills/setup) | Write `docs/agents/skills-config.md` — the file every other skill reads. Interviews you about stack, verify command, docs layout, domains, sensitive domains, flows, conventions. |
 | [`bootstrap`](skills/bootstrap) | Scaffold the docs the skills consume — `CORE_TENETS.md` and per-domain `premises.md` — with real content mined from the code and an interview. |
 
 ## How portability works
 
 Nothing about a stack is hardcoded. Each skill reads **`docs/agents/skills-config.md`** in the
 repo it's running in. That file declares the verify command, where premises live, which domains
-are *sensitive* (and so get the heavy planning/review path), the repo's extra review lenses, and
+are *sensitive* (and so get the heavy planning/review path), the repo's key flows (each becomes a dedicated review lens), and
 the commit/PR conventions. Run `setup` once to write it; edit it by hand anytime.
 
 So the first run on a new repo is:

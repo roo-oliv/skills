@@ -12,7 +12,7 @@ planner forgets. The backend's canonical example is the set of paths that create
 settlement records (provider webhooks, manual CSV imports, third-party
 notifications, manual corrections); each distributes money over a base and each
 needs a cap. Your repo's seams are whatever paths write the affected state — read
-the configured **Lenses** (`docs/agents/skills-config.md` › Lenses) and the
+the **flow docs** (`docs/agents/skills-config.md` › Flows) and the
 domain premises to learn what they are.
 
 ## Your inputs

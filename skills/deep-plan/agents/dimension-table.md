@@ -33,7 +33,7 @@ the code tells you what those variables mean today.
 
 When the change touches one of the repo's **Sensitive domains**
 (`docs/agents/skills-config.md` › Sensitive domains), this lens is load-bearing.
-The configured **Lenses** (`docs/agents/skills-config.md` › Lenses) name the
+The **flow docs** (`docs/agents/skills-config.md` › Flows) name the
 derived-quantity concern this repo cares about — read them and apply the matching
 one to this change. The backend example, for reference, is a money flow with a
 reconciliation invariant (`sum(active receivable amounts per charge) ==

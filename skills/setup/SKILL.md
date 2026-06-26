@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Configure this repo for the engineering skills — stack, verify command, docs layout, domains, sensitive domains, lenses, and conventions. Run once before first use of deep-review / deep-plan / refine / implement / review-fix-loop.
+description: Configure this repo for the engineering skills — stack, verify command, docs layout, domains, sensitive domains, flows, and conventions. Run once before first use of deep-review / deep-plan / refine / implement / review-fix-loop.
 disable-model-invocation: true
 ---
 
@@ -47,8 +47,9 @@ The sections (full schema + per-repo examples in [skills-config.template.md](./s
 - **Sensitive domains** — the subset where mistakes are expensive/irreversible (money, data
   loss, security, safety). This is the single most important answer: it decides when the heavy
   deep-plan/deep-review path and the PR gate fire. **Empty is a valid answer** — say so.
-- **Lenses** — domain-specific review lenses beyond the universal set. Optional; can start empty
-  and grow.
+- **Flows** — where the repo's flow docs live (default `docs/flows/`); each flow doc becomes a
+  dedicated review lens on top of the universal set. Optional; point the user at `bootstrap` to
+  author the docs themselves. Just record the directory here.
 - **Conventions** — commit/PR language, conventional commits, branch naming, pointers to the
   repo's git/test conventions, any commit trailer.
 
@@ -68,7 +69,7 @@ Let the user edit before writing. Then:
 
    The engineering skills (deep-review, deep-plan, refine, implement, review-fix-loop) read
    their per-repo configuration from `docs/agents/skills-config.md` — stack, verify command,
-   docs layout, domains, sensitive domains, lenses, conventions. Edit that file to retune them.
+   docs layout, domains, sensitive domains, flows, conventions. Edit that file to retune them.
    ```
 
 ## 4. Done

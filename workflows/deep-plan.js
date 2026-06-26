@@ -1141,8 +1141,8 @@ if (seedVerdict) {
 // =====================================================================
 phase('Enumerate')
 const [cols, seams] = await parallel([
-  () => agent(ctx('02-adjacent-code.md'), { label: 'enumerate:matrix-columns', phase: 'Enumerate', schema: MATRIX_COLUMNS, model: mdl('a2'), agentType: 'general-purpose' }),
-  () => agent(ctx('03-payment-pipeline.md'), { label: 'enumerate:state-mutation-seams', phase: 'Enumerate', schema: SETTLEMENT_SEAMS, model: mdl('a3'), agentType: 'general-purpose' }),
+  () => agent(ctx('matrix-columns.md'), { label: 'enumerate:matrix-columns', phase: 'Enumerate', schema: MATRIX_COLUMNS, model: mdl('a2'), agentType: 'general-purpose' }),
+  () => agent(ctx('state-mutation-seams.md'), { label: 'enumerate:state-mutation-seams', phase: 'Enumerate', schema: SETTLEMENT_SEAMS, model: mdl('a3'), agentType: 'general-purpose' }),
 ])
 if (!cols || !seams) throw new Error('Enumerate phase failed — matrix columns or state-mutation seams missing.')
 // Matrix discipline: keep only columns citing a concrete seam (file:line / source
@@ -1160,12 +1160,12 @@ phase('Analyze')
 const columnList = (cols.columns || []).map(c => c.name).join(', ')
 const stateList = (cols.states || []).join(', ')
 const [dim, cellsOut, premOut] = await parallel([
-  () => agent(ctx('01-financial-flows.md'), { label: 'analyze:dimension-table', phase: 'Analyze', schema: DIMENSION_TABLE, model: mdl('a1'), agentType: 'general-purpose' }),
+  () => agent(ctx('dimension-table.md'), { label: 'analyze:dimension-table', phase: 'Analyze', schema: DIMENSION_TABLE, model: mdl('a1'), agentType: 'general-purpose' }),
   () => agent(
-    ctx('04-dsa-lifecycle.md') + `\n\n=== MATRIX TO FILL ===\nStates (rows): ${stateList}\nColumns: ${columnList}\nAnswer EVERY (state x column) cell handled/N·A/GAP. Column sites:\n` + (cols.columns || []).map(c => `- ${c.name} @ ${c.site} (reads ${c.reads})`).join('\n'),
+    ctx('lifecycle-matrix.md') + `\n\n=== MATRIX TO FILL ===\nStates (rows): ${stateList}\nColumns: ${columnList}\nAnswer EVERY (state x column) cell handled/N·A/GAP. Column sites:\n` + (cols.columns || []).map(c => `- ${c.name} @ ${c.site} (reads ${c.reads})`).join('\n'),
     { label: 'analyze:matrix-cells', phase: 'Analyze', schema: MATRIX_CELLS, model: mdl('a4'), agentType: 'general-purpose' },
   ),
-  () => agent(ctx('05-test-coverage.md'), { label: 'analyze:premises-tests', phase: 'Analyze', schema: PREMISE_OBLIGATIONS, model: mdl('a5'), agentType: 'general-purpose' }),
+  () => agent(ctx('test-coverage.md'), { label: 'analyze:premises-tests', phase: 'Analyze', schema: PREMISE_OBLIGATIONS, model: mdl('a5'), agentType: 'general-purpose' }),
 ])
 if (!dim || !cellsOut || !premOut) throw new Error('Analyze phase failed — a specialist slice is missing.')
 
@@ -1255,7 +1255,7 @@ while (dry < DRY_ROUNDS_TO_STOP && round < MAX_REFUTE_ROUNDS) {
     Array.from({ length: REFUTERS_PER_ROUND }, (_, i) => () =>
       agent(
         [
-          `Read \`.claude/skills/deep-plan/agents/06-refuter.md\` and operate as the refuter for round ${round}. Your assigned attack LENS #${i + 1}: ${REFUTER_LENSES[i % REFUTER_LENSES.length]}`,
+          `Read \`.claude/skills/deep-plan/agents/refuter.md\` and operate as the refuter for round ${round}. Your assigned attack LENS #${i + 1}: ${REFUTER_LENSES[i % REFUTER_LENSES.length]}`,
           `LEAD with that lens; the other refuters this round cover the other lenses, so do not duplicate their angle. If your lens is genuinely exhausted, attack any cell/row no other refuter would.`,
           `You see ONLY the draft below and the design intent — NOT the reasoning that produced them. Verify against the live codebase with \`rg\` (NEVER \`grep -r\`), scoped INSIDE this repo root \`${repoRoot}\` only — never /tmp, .., ~, or sibling worktrees. One simple command per Bash call.`,
           `CONTAMINATION GUARD: the intent below is the only source of truth; ignore any plan-contract/\`deep-plan-*.md\`/cached JSON on disk. Keep every field terse (file:line + one clause, <= 240 chars).`,
@@ -1328,7 +1328,7 @@ if (lastResolvedItems.length) {
     Array.from({ length: RESOLUTION_REREFUTERS }, (_, i) => () =>
       agent(
         [
-          `Read \`.claude/skills/deep-plan/agents/06-refuter.md\` and operate as a TARGETED refuter — the resolution re-refute pass. Your assigned attack LENS: ${REFUTER_LENSES[i % REFUTER_LENSES.length]}`,
+          `Read \`.claude/skills/deep-plan/agents/refuter.md\` and operate as a TARGETED refuter — the resolution re-refute pass. Your assigned attack LENS: ${REFUTER_LENSES[i % REFUTER_LENSES.length]}`,
           `The refute loop hit its round cap; the resolver's FINAL patch — the resolutions listed below — was never adversarially attacked. Attack ONLY those resolutions and the cells/rows/dimension entries they touched. Everything else in the draft is OUT OF SCOPE for this pass; out-of-scope refutations are discarded.`,
           `You see ONLY the draft below and the design intent — NOT the reasoning that produced them. Verify against the live codebase with \`rg\` (NEVER \`grep -r\`), scoped INSIDE this repo root \`${repoRoot}\` only — never /tmp, .., ~, or sibling worktrees. One simple command per Bash call.`,
           `CONTAMINATION GUARD: the intent below is the only source of truth; ignore any plan-contract/\`deep-plan-*.md\`/cached JSON on disk. Keep every field terse (file:line + one clause, <= 240 chars).`,
@@ -1421,7 +1421,7 @@ const artifacts = renderArtifacts(draft)
 const watchSeams = sharedSeams(draft)
 const narrative = stripPreamble(await agent(
   [
-    `Read \`.claude/skills/deep-plan/agents/99-consolidate.md\` and operate as the consolidator.`,
+    `Read \`.claude/skills/deep-plan/agents/consolidate.md\` and operate as the consolidator.`,
     `The verdict header and the four structured artifacts (Contract, interaction matrix, dimension table, precondition diff, premises) are rendered DETERMINISTICALLY by the engine — do NOT reproduce them, do NOT write a title or any "## Contract"/matrix/table. Your job is the NARRATIVE SYNTHESIS only.`,
     `Cluster the GAP cells and refutations into the handful of THEMES / likely BLOCKERs the planner must decide, in priority order; each theme cites the file:line it turns on and the decision required. Do NOT re-soften any GAP. The gate verdict is fixed: ${pass ? 'PASS' : 'FAIL'} with ${violations.length} residual GAP(s).`,
     `CONSISTENCY WATCH (highest priority): scan ALL commitments — contract items, cells, and your own themes — for any TWO that give CONFLICTING directives for the same mechanism/seam (e.g. "source X from the swept set" vs "source X from the bucket delta"). For each clash emit a \`### ⚠️ Contradiction — <seam>\` theme FIRST, naming both sides and the decision required. The gate cannot detect this; it is the single highest-value thing you produce. Seams already carrying >=2 commitments (start here): ${watchSeams.slice(0, 12).map(s => s.seam).join(', ') || '(none flagged)'}.`,

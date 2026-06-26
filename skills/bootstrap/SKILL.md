@@ -1,6 +1,6 @@
 ---
 name: bootstrap
-description: Scaffold the agent-facing documentation the other skills read — CORE_TENETS (cross-cutting invariants) and per-domain premises files. Run on a repo that doesn't have them yet, or to add a domain. Interview-driven; writes real content, not empty stubs.
+description: Scaffold the agent-facing documentation the other skills read — CORE_TENETS (cross-cutting invariants), per-domain premises files, and per-flow flow docs (each becomes a dedicated review lens). Run on a repo that doesn't have them yet, or to add a domain/flow. Interview-driven; writes real content, not empty stubs.
 disable-model-invocation: true
 ---
 
@@ -89,14 +89,33 @@ Rules:
 - Where a load-bearing invariant has no executable guard, note it — `deep-plan`/`deep-review`
   will later suggest a `require`/`check` seam.
 
-## 4. Index (optional)
+## 4. Flow docs — one per key flow
+
+A **flow** is a path that data / state / money takes through the system that must be reasoned
+about as a whole (a payment pipeline, a level-load sequence, an auth handshake). `deep-review`
+spawns a dedicated lens per flow doc, so this is where a repo declares the domain-specific review
+knowledge that used to be hardcoded. Interview for them:
+
+- "What are the end-to-end flows where a change in one place can break something three steps
+  away?" — those are the flows worth a doc.
+
+For each, write a flow doc into the flows dir (config › Flows, default `docs/flows/<flow>.md`)
+using the format in [flow.template.md](./flow.template.md). A flow doc reads like a **dedicated
+core-tenet for that flow** — descriptive, not "check that…" — but carries the path, the entities
+& lifecycle, the invariants, the load-bearing quantities, and the failure modes a reviewer needs.
+Set the frontmatter `covers:` globs so the lens only runs when the flow is touched. Mine the real
+flow from the code (trace it end-to-end) before writing; don't invent flows the repo doesn't have
+— a repo with no load-bearing flows declares none, and the universal lenses still run.
+
+## 5. Index (optional)
 
 If the repo uses a docs index (or the user wants one), write/update `docs/index.md` (or the
-repo's convention) listing the tenets file and each domain's premises with a one-line hook, so
-the set is discoverable.
+repo's convention) listing the tenets file, each domain's premises, and each flow doc with a
+one-line hook, so the set is discoverable.
 
-## 5. Confirm and write
+## 6. Confirm and write
 
-Show drafts before writing. Write `CORE_TENETS.md` and the premises files at the configured
-paths. Tell the user which domains still need premises (so they know the coverage is partial
-and intentional) and that `deep-plan`/`deep-review` will now read these.
+Show drafts before writing. Write `CORE_TENETS.md`, the premises files, and the flow docs at the
+configured paths. Tell the user which domains still need premises and which flows still need docs
+(so they know the coverage is partial and intentional) and that `deep-plan`/`deep-review` will now
+read these.
