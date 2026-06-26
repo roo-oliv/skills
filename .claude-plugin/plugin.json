@@ -1,0 +1,13 @@
+{
+  "name": "roo-oliv-skills",
+  "description": "Portable, config-driven engineering skills: a refine → deep-plan → implement → review-fix-loop pipeline, deep-review, and setup/bootstrap. Each reads docs/agents/skills-config.md so it adapts per repo.",
+  "skills": [
+    "./skills/setup",
+    "./skills/bootstrap",
+    "./skills/refine",
+    "./skills/deep-plan",
+    "./skills/implement",
+    "./skills/review-fix-loop",
+    "./skills/deep-review"
+  ]
+}
