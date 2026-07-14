@@ -49,6 +49,7 @@ If the brief is unambiguous, **say so in one line and proceed** — don't fabric
 Write the plan following the plan-contract spec from **Docs layout** (`docs/agents/skills-config.md` › Planning › plan-contract spec). If config lists no plan-contract spec, default to the canonical four artifacts described below and say so.
 
 - **Prose**: context, chosen approach (and discarded alternatives, with 1 line of why each), implementation phases if multi-phase.
+- **`## Code map`** (whenever Phase 1 dispatched Explore agents): the `file:line` seams the agents mapped — the central method of each touched flow, existing guards/gates, callers, the tests that cover the flow today. This map is the pipeline's **case file**: `/implement`'s waves and the review loop's bounded agents (fixer, validator, enumerator) navigate by it instead of re-mapping the codebase from scratch — every stage that re-discovers the same file:line pays the search phase again. It deliberately does NOT feed the breadth reviewers (the fresh-eyes lenses): the map is the author's view, and feeding it to clean eyes anchors exactly the look that exists in order not to anchor.
 - **`## Contract`** (always): a flat numbered list of atomic, individually verifiable commitments.
 - **Interaction matrix** and **Precondition diff**: when the plan-contract triggers apply (new entity status/lifecycle, state machine, long-lived RESERVED/PENDING record; deleted/replaced method/flow or copied guard).
 - **Metadata header** at the top of the file:
@@ -59,7 +60,7 @@ Write the plan following the plan-contract spec from **Docs layout** (`docs/agen
 **Source:** {text | file | resolved URL}
 **Suggested branch:** {type}/{kebab-slug}   ← follow the commit/PR conventions from config › Conventions
 **Domains:** {list}
-**Risk tier:** {direct | deep-plan} — {1-line justification}
+**Risk tier:** {direct | deep-plan (reduced — single refutation) | deep-plan} — {1-line justification}
 **Status:** DRAFT
 ```
 
@@ -80,7 +81,9 @@ Decide **on your own** — don't ask — and state the decision with a 1–2 lin
 
 Otherwise, go direct. On a genuine doubt between tiers in a sensitive domain, prefer deep-plan (false-heavy is cheap; false-light ships the gap).
 
-When deep-plan runs: use its "Write artifacts into the plan" option to merge the refuted contract into the plan file, and **note in the header** `**Risk tier:** deep-plan (ran — contract merged)`. Residual GAPs become explicit approval items in Phase 6, never silently accepted. The standalone contract that deep-plan writes to `.claude/deep-plan/<branch>-<shortSha>.md` is committed by `/implement`'s wave 1 (it is what the PR gate reads).
+**Intermediate tier — reduced deep-plan (single refutation):** when a deep-plan trigger holds but the root cause is already **confirmed in the code with file:line** and the change is **single-seam** (one method/formula, no new status and no state machine), deep-plan's full fan-out re-pays enumeration Phase 1 already did. In that case: fill the artifacts yourself (Contract, interaction matrix, dimension table, precondition diff) from the Phase 1 map, and dispatch **1 adversarial refuter agent** (multi-lens in the prompt: the real algebra/caps, consumers, existing tests that would break, constructibility of the scenarios) over the complete plan. Incorporate the refutations and note in the header `**Risk tier:** deep-plan (reduced — single refutation)`. Calibration from a real production run of this pipeline (a single-seam sensitive-domain bugfix with a refuted plan-contract): the single refuter cost ~4% of the pipeline's tokens and caught the run's only planning Blocker — the best ROI in the pipeline. What the reduced tier cuts is the enumeration fan-out, never the refutation. Write the standalone contract to `.claude/deep-plan/<branch>-<shortSha>.md` all the same (it is what the PR gate reads).
+
+When the full deep-plan runs: use its "Write artifacts into the plan" option to merge the refuted contract into the plan file, and **note in the header** `**Risk tier:** deep-plan (ran — contract merged)`. Residual GAPs become explicit approval items in Phase 6, never silently accepted. The standalone contract that deep-plan writes to `.claude/deep-plan/<branch>-<shortSha>.md` is committed by `/implement`'s wave 1 (it is what the PR gate reads).
 
 ## Phase 6 — Final approval (always)
 

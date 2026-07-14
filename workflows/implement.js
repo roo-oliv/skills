@@ -220,11 +220,29 @@ ${JSON.stringify(residual, null, 2)}
 }
 
 // ---------------------------------------------------------------------------
+// Resilience: agent({schema}) THROWS when the subagent finishes without a
+// StructuredOutput (throttling / retry cap), and a throw takes down the WHOLE
+// workflow even with waves already completed, committed, and pushed (real case:
+// the PR author opened the PR and crashed only at the report step — the entire
+// run surfaced as "failed"). Degrade to null: every call site below already has
+// null semantics.
+// ---------------------------------------------------------------------------
+
+async function tryAgent(prompt, opts) {
+  try {
+    return await agent(prompt, opts)
+  } catch (e) {
+    log(`agent ${opts?.label || '?'} crashed without structured output — degrading to null (${String((e && e.message) || e).slice(0, 140)})`)
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Phases
 // ---------------------------------------------------------------------------
 
 phase('Setup')
-const setup = await agent(setupPrompt(), { schema: SETUP_RESULT, label: 'setup' })
+const setup = await tryAgent(setupPrompt(), { schema: SETUP_RESULT, label: 'setup' })
 if (!setup) return { status: 'blocked', stage: 'setup', reason: 'setup agent died without a result' }
 if (!setup.branchOk) return { status: 'blocked', stage: 'setup', reason: setup.blockedReason || 'invalid branch/preflight' }
 
@@ -245,11 +263,11 @@ const closeFailure = (r) => {
   return null
 }
 for (const wave of waves) {
-  let res = await agent(wavePrompt(wave), { schema: WAVE_RESULT, label: `wave-${wave.id}: ${wave.title}`, phase: 'Implement' })
+  let res = await tryAgent(wavePrompt(wave), { schema: WAVE_RESULT, label: `wave-${wave.id}: ${wave.title}`, phase: 'Implement' })
   let failure = closeFailure(res)
   if (failure) {
     log(`wave ${wave.id} did not close (${failure.slice(0, 160)}) — single retry with a fresh agent`)
-    res = await agent(wavePrompt(wave, failure), { schema: WAVE_RESULT, label: `wave-${wave.id}-retry`, phase: 'Implement' })
+    res = await tryAgent(wavePrompt(wave, failure), { schema: WAVE_RESULT, label: `wave-${wave.id}-retry`, phase: 'Implement' })
     failure = closeFailure(res)
   }
   if (failure) {
@@ -269,7 +287,7 @@ phase('Verify')
 let green = false
 let failingSummary = ''
 for (let attempt = 1; attempt <= 3 && !green; attempt++) {
-  const v = await agent(verifyPrompt(attempt, failingSummary), { schema: VERIFY_RESULT, label: `verify-${attempt}`, phase: 'Verify' })
+  const v = await tryAgent(verifyPrompt(attempt, failingSummary), { schema: VERIFY_RESULT, label: `verify-${attempt}`, phase: 'Verify' })
   green = !!v?.green
   failingSummary = v?.failingSummary || ''
   if (!green) log(`verify attempt ${attempt}: still red — ${failingSummary.slice(0, 200)}`)
@@ -278,21 +296,36 @@ if (!green) {
   return { status: 'verify-failed', stage: 'verify', failingSummary, wavesDone: waveReports, decisions: allDecisions, note: 'branch pushed with a red build — do NOT open a PR' }
 }
 
-let recon = await agent(reconPrompt(false), { schema: RECON_RESULT, label: 'verify-plan', phase: 'Verify' })
+let recon = await tryAgent(reconPrompt(false), { schema: RECON_RESULT, label: 'verify-plan', phase: 'Verify' })
 let reconFixed = false
 if (recon && ((recon.missing || []).length || (recon.diverged || []).length || (recon.untestedPremises || []).length)) {
   log(`verify-plan: ${(recon.missing || []).length} missing, ${(recon.diverged || []).length} diverged, ${(recon.untestedPremises || []).length} premise(s) without a test — 1 fix round`)
-  const fix = await agent(reconFixPrompt(recon), { schema: WAVE_RESULT, label: 'recon-fix', phase: 'Verify' })
+  const fix = await tryAgent(reconFixPrompt(recon), { schema: WAVE_RESULT, label: 'recon-fix', phase: 'Verify' })
   if (fix?.decisions) allDecisions.push(...fix.decisions)
   reconFixed = true
-  recon = await agent(reconPrompt(true), { schema: RECON_RESULT, label: 'verify-plan-recheck', phase: 'Verify' })
+  recon = await tryAgent(reconPrompt(true), { schema: RECON_RESULT, label: 'verify-plan-recheck', phase: 'Verify' })
 }
 const residual = recon || { missing: [], diverged: [], unplanned: [] }
 
 phase('PR')
-const pr = await agent(prPrompt(setup, allDecisions, residual, reconFixed, allTestEvidence), { schema: PR_RESULT, label: 'pr-author', phase: 'PR' })
+const pr = await tryAgent(prPrompt(setup, allDecisions, residual, reconFixed, allTestEvidence), { schema: PR_RESULT, label: 'pr-author', phase: 'PR' })
+if (!pr) {
+  // The PR author works (rebase, push, gh pr create) BEFORE reporting — a crash at the report
+  // step does not mean the PR was not opened. 'pr-unconfirmed' tells the orchestrator to check
+  // `gh pr view --head <branch>` and resume from the ledger instead of re-running from scratch.
+  return {
+    status: 'pr-unconfirmed',
+    stage: 'pr',
+    note: 'pr-author died without structured output — the PR may have been opened; run gh pr view --head and read the ledger before re-running',
+    resumed: setup.resumed,
+    wavesDone: waveReports,
+    decisions: allDecisions,
+    testEvidence: allTestEvidence,
+    verifyPlanResiduals: residual,
+  }
+}
 return {
-  status: pr?.status || 'blocked',
+  status: pr.status || 'blocked',
   stage: 'pr',
   prNumber: pr?.prNumber,
   prUrl: pr?.prUrl,
