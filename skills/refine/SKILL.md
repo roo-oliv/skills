@@ -60,7 +60,7 @@ Write the plan following the plan-contract spec from **Docs layout** (`docs/agen
 **Source:** {text | file | resolved URL}
 **Suggested branch:** {type}/{kebab-slug}   ← follow the commit/PR conventions from config › Conventions
 **Domains:** {list}
-**Risk tier:** {direct | deep-plan} — {1-line justification}
+**Risk tier:** {direct | deep-plan (reduced — single refutation) | deep-plan} — {1-line justification}
 **Status:** DRAFT
 ```
 
