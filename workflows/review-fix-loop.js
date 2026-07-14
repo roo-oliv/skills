@@ -23,12 +23,25 @@ if (missingArgs.length) {
 }
 
 const PR = ARGS.prNumber
-const MAX_ROUNDS = Math.min(Math.max(ARGS.maxRounds || 5, 1), 10)
-const MAX_EXTENSIONS = Math.min(Math.max(ARGS.maxExtensions ?? 2, 0), 5)
-const MAX_ENUM_SURFACES = Math.min(Math.max(ARGS.maxEnumSurfaces ?? 6, 1), 12)
+// Cadence profile: 'thorough' (the historical default — redundancy calibrated for models whose
+// individual passes are less reliable) vs 'direct' (strong passes: fewer rounds/surfaces and a
+// SCOPED exhaustion gate — see gateAgents). Explicit overrides (maxRounds etc.) beat the profile.
+const PROFILE = ARGS.profile === 'direct' ? 'direct' : 'thorough'
+const PROFILE_DEFAULTS = PROFILE === 'direct'
+  ? { maxRounds: 3, maxExtensions: 1, maxEnumSurfaces: 4 }
+  : { maxRounds: 5, maxExtensions: 2, maxEnumSurfaces: 6 }
+const MAX_ROUNDS = Math.min(Math.max(ARGS.maxRounds || PROFILE_DEFAULTS.maxRounds, 1), 10)
+const MAX_EXTENSIONS = Math.min(Math.max(ARGS.maxExtensions ?? PROFILE_DEFAULTS.maxExtensions, 0), 5)
+const MAX_ENUM_SURFACES = Math.min(Math.max(ARGS.maxEnumSurfaces ?? PROFILE_DEFAULTS.maxEnumSurfaces, 1), 12)
 const ROLE_DIR = `${ARGS.repoRoot}/.claude/skills/review-fix-loop/agents`
 const DEEP_DIR = `${ARGS.repoRoot}/.claude/skills/deep-review/agents`
 const CONFIG = 'docs/agents/skills-config.md'
+// Terminal-push verify: under 'direct' the full build stays with the PR's CI (the authoritative
+// gate, which the orchestrator watches via gh pr checks) — the terminal fixer runs the targeted
+// verify. Under 'thorough' the terminal push leaves with the full local Verify (historical behavior).
+const TERMINAL_VERIFY = PROFILE === 'direct'
+  ? `run the TARGETED verify (format/lint + the tests covering the branch diff + the always-run gates from ${CONFIG} › Verify) before the final push — the FULL Verify command stays with the PR's CI, which is the authoritative gate and is watched by the orchestrator`
+  : `run the FULL Verify command (${CONFIG} › Verify › Full) before the final push`
 
 // Deep mode fans out the genericized deep-review lens set installed alongside this skill:
 // the UNIVERSAL lenses (always, by flat role-file name) + one FLOW lens per flow doc the
@@ -275,8 +288,8 @@ function fixerPrompt(findings, round, opts) {
 Read ${ROLE_DIR}/fixer.md and operate as that agent (round ${round}).
 
 ${opts.finalRound
-    ? `FINAL ROUND: the review zeroed High/Blocker. Address the pending Medium/Low below. After you NO ONE reviews again — run the FULL Verify command (${CONFIG} › Verify › Full) before the final push.`
-    : `Address the Blocker/High below${aged.length ? ` and the AGED Mediums (≥2 rounds in the queue — assigned, not optional: fix or formal divergence): ${JSON.stringify(aged)}` : ''}. Opportunistic Mediums (same files): ${JSON.stringify(opts.mediumsInSameFiles || [])}${opts.mustFullVerify ? `\n\nLAST POSSIBLE ROUND (loop cap): after you no review validates and no fixer corrects — run the FULL Verify command (${CONFIG} › Verify › Full) before the push, exactly like a final round.` : ''}`}
+    ? `FINAL ROUND: the review zeroed High/Blocker. Address the pending Medium/Low below. After you NO ONE reviews again — ${TERMINAL_VERIFY}.`
+    : `Address the Blocker/High below${aged.length ? ` and the AGED Mediums (≥2 rounds in the queue — assigned, not optional: fix or formal divergence): ${JSON.stringify(aged)}` : ''}. Opportunistic Mediums (same files): ${JSON.stringify(opts.mediumsInSameFiles || [])}${opts.mustFullVerify ? `\n\nLAST POSSIBLE ROUND (loop cap): after you no review validates and no fixer corrects — ${TERMINAL_VERIFY}, exactly like a final round.` : ''}`}
 
 Assigned findings:
 ${JSON.stringify(findings, null, 2)}`
@@ -307,6 +320,24 @@ Trajectory:
 ${JSON.stringify(roundsSummary, null, 2)}
 
 Return only an empty { "findings": [] } in the schema (the comment is the effect).`
+}
+
+// ---------------------------------------------------------------------------
+// Resilience: agent({schema}) THROWS when the subagent finishes without a
+// StructuredOutput (throttling / retry cap), and a throw on a direct await takes
+// down the WHOLE workflow even though earlier agents' work is already committed
+// and pushed. Degrade to null: every call site below already has null semantics
+// (fallback, retry, or blocked). Thunks inside parallel() already resolve to
+// null via the runtime — the wrapper is for the direct awaits.
+// ---------------------------------------------------------------------------
+
+async function tryAgent(prompt, opts) {
+  try {
+    return await agent(prompt, opts)
+  } catch (e) {
+    log(`agent ${opts?.label || '?'} crashed without structured output — degrading to null (${String((e && e.message) || e).slice(0, 140)})`)
+    return null
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +386,7 @@ let mode = ARGS.modeHint === 'deep' || ARGS.modeHint === 'standard' ? ARGS.modeH
 if (mode) {
   log(`mode forced by the user: ${mode}`)
 } else {
-  const c = await agent(classifyPrompt(), { schema: CLASSIFY_RESULT, label: 'classify' })
+  const c = await tryAgent(classifyPrompt(), { schema: CLASSIFY_RESULT, label: 'classify' })
   mode = c?.mode === 'deep' ? 'deep' : 'standard'
   log(`mode: ${mode} — ${c?.reason || 'classifier died; fallback standard'}`)
 }
@@ -378,35 +409,56 @@ let blockedReason = null
 // lenses does NOT confirm exhaustion; the verdict becomes clean-partial and the orchestrator runs a
 // confirmation pass.
 const lensFailures = []
+// Scoped gate (profile=direct): lenses that produced ≥1 finding in some breadth round are the
+// signal; the gate re-runs only those + negative-space + contract×code. The full fan-out returns
+// if ANY Blocker appeared in the loop (a fix regression is exactly when full fresh eyes pay).
+// Exhaustion declared by a scoped gate covers the scoped set — a deliberate, logged cadence
+// decision, not a silent shortcut.
+const lensHits = new Set()
+let sawBlocker = false
+const GATE_CORE_LENSES = ['negspace', 'contract']
+function gateAgents() {
+  if (PROFILE !== 'direct' || sawBlocker) return DEEP_AGENTS
+  const scoped = DEEP_AGENTS.filter((a) => lensHits.has(a.key) || GATE_CORE_LENSES.includes(a.key))
+  return scoped.length ? scoped : DEEP_AGENTS
+}
 
 for (let round = 1; round <= effectiveMax; round++) {
   let freshFindings = []
   let enumInfo = { findings: [], dry: true, surfaces: [], unchecked: 0, truncated: false }
   let roundKind
   let roundDegradedLenses = [] // keys of the lenses that crashed THIS round (empty outside breadth/gate)
+  let roundLenses = null // number of lenses that ran this round (breadth/gate; null otherwise)
 
   if (mode === 'standard') {
     // --- Standard: 1 breadth reviewer per round (simple PRs; no enumeration) ---
     roundKind = 'standard'
-    const r = await agent(standardReviewPrompt(round), { schema: FINDINGS, label: `review r${round}`, phase: 'Review' })
+    const r = await tryAgent(standardReviewPrompt(round), { schema: FINDINGS, label: `review r${round}`, phase: 'Review' })
     freshFindings = r?.findings ?? []
   } else if (round === 1 || pendingGate) {
-    // --- Breadth (round 1 or fresh-eyes gate): fan-out of the lens set + consolidation + enumeration ---
+    // --- Breadth (round 1 or fresh-eyes gate): fan-out of the lens set + consolidation + enumeration.
+    // On the gate with profile=direct (and no Blocker in the loop), the fan-out is SCOPED — see gateAgents. ---
     roundKind = pendingGate ? 'gate' : 'breadth'
     pendingGate = false
-    const slices = await parallel(DEEP_AGENTS.map((a) => () =>
+    const roundAgents = roundKind === 'gate' ? gateAgents() : DEEP_AGENTS
+    if (roundAgents.length < DEEP_AGENTS.length) {
+      log(`gate SCOPED (profile=direct, 0 Blockers in the loop): ${roundAgents.length}/${DEEP_AGENTS.length} lenses — ${roundAgents.map((a) => a.key).join(', ')}; lenses with no signal in breadth rounds sit out (cadence decision; exhaustion is confirmed over this set)`)
+    }
+    roundLenses = roundAgents.length
+    const slices = await parallel(roundAgents.map((a) => () =>
       agent(deepReviewPrompt(a, round, roundKind), { schema: FINDINGS, label: `deep:${a.key} r${round}`, phase: 'Review' })
     ))
     // Crashed lenses fall to null here. Record them to downgrade clean→clean-partial: a "clean" verdict
     // over a partial lens set is FALSE-clean (a loop can go clean with a crashed lens; a confirmation pass
     // catches a High that the missing lens would have found).
-    roundDegradedLenses = DEEP_AGENTS.filter((_, i) => !slices[i]).map((a) => a.key)
+    roundDegradedLenses = roundAgents.filter((_, i) => !slices[i]).map((a) => a.key)
     if (roundDegradedLenses.length) {
       lensFailures.push({ round, kind: roundKind, lenses: roundDegradedLenses })
-      log(`round ${round} (${roundKind}): ${roundDegradedLenses.length}/${DEEP_AGENTS.length} lens(es) crashed — ${roundDegradedLenses.join(', ')}; breadth coverage DEGRADED (exhaustion not confirmable by these lenses)`)
+      log(`round ${round} (${roundKind}): ${roundDegradedLenses.length}/${roundAgents.length} lens(es) crashed — ${roundDegradedLenses.join(', ')}; breadth coverage DEGRADED (exhaustion not confirmable by these lenses)`)
     }
+    slices.forEach((s, i) => { if (s && (s.findings || []).length) lensHits.add(roundAgents[i].key) })
     const valid = slices.filter(Boolean)
-    const cons = await agent(consolidatePrompt(valid, round), { schema: FINDINGS, label: `consolidate r${round}`, phase: 'Review' })
+    const cons = await tryAgent(consolidatePrompt(valid, round), { schema: FINDINGS, label: `consolidate r${round}`, phase: 'Review' })
     const consolidated = cons?.findings ?? valid.flatMap((s) => s.findings || [])
     enumInfo = await enumerateSurfaces(consolidated, round, { postFix: false })
     freshFindings = consolidated.concat(enumInfo.findings)
@@ -421,7 +473,7 @@ for (let round = 1; round <= effectiveMax; round++) {
     const fixedById = new Map((lastFixResult?.fixed || []).map((f) => [f.id, f.note || '']))
     const claims = lastHighBlocker.filter((f) => fixedById.has(f.id)).map((f) => ({ ...f, fixNote: fixedById.get(f.id) }))
     if (claims.length) {
-      const val = await agent(validationPrompt(claims, lastFixResult, false), { schema: VALIDATION_RESULT, label: `validate r${round}`, phase: 'Review' })
+      const val = await tryAgent(validationPrompt(claims, lastFixResult, false), { schema: VALIDATION_RESULT, label: `validate r${round}`, phase: 'Review' })
       if (val) {
         const stillById = new Map((val.stillOpen || []).map((s) => [s.id, s.why]))
         stillOpen = claims.filter((c) => stillById.has(c.id)).map((c) => ({ ...c, description: `${String(c.description).slice(0, 280)} [validator: ${stillById.get(c.id)}]`.slice(0, 500), source: 'post-fix validator' }))
@@ -435,7 +487,7 @@ for (let round = 1; round <= effectiveMax; round++) {
     let fdFindings = []
     const commits = lastFixResult?.commits || []
     if (commits.length) {
-      const fd = await agent(fixDiffPrompt(commits, round), { schema: FINDINGS, label: `fixdiff r${round}`, phase: 'Review' })
+      const fd = await tryAgent(fixDiffPrompt(commits, round), { schema: FINDINGS, label: `fixdiff r${round}`, phase: 'Review' })
       fdFindings = (fd?.findings ?? []).map((f) => ({ ...f, source: f.source || 'fix-diff' }))
     }
 
@@ -446,13 +498,14 @@ for (let round = 1; round <= effectiveMax; round++) {
   }
 
   // --- Conciliate (the only stage that reads the PR history; posts the consolidated review) ---
-  const con = await agent(
+  const con = await tryAgent(
     conciliatePrompt(freshFindings, state, round, mode, roundKind, Object.fromEntries(mediumAge)),
     { schema: CONSOLIDATED, label: `conciliate r${round}`, phase: 'Conciliate' }
   )
   const findings = con?.findings ?? freshFindings
   const highBlocker = findings.filter((f) => f.severity === 'Blocker' || f.severity === 'High')
   const mediumLow = findings.filter((f) => f.severity === 'Medium' || f.severity === 'Low')
+  if (findings.some((f) => f.severity === 'Blocker')) sawBlocker = true
 
   // --- Medium aging: ≥2 rounds in the queue → no longer optional for the fixer ---
   findings.filter((f) => f.severity === 'Medium').forEach((f) => mediumAge.set(f.id, (mediumAge.get(f.id) || 0) + 1))
@@ -469,6 +522,7 @@ for (let round = 1; round <= effectiveMax; round++) {
     enumSurfaces: enumInfo.surfaces.length,
     agedMediums: agedMediums.length,
     degraded: roundDegradedLenses.length,
+    lenses: roundLenses,
     commentUrl: con?.commentUrl,
   })
   log(`round ${round} (${roundKind}): ${highBlocker.length} High/Blocker · ${mediumLow.length} Medium/Low · enum ${enumInfo.dry ? 'dry' : 'NOT dry'} — ${con?.commentUrl || 'comment not confirmed'}`)
@@ -490,7 +544,7 @@ for (let round = 1; round <= effectiveMax; round++) {
     const exhausted = mode === 'standard' || (roundKind !== 'depth' && enumInfo.dry)
     if (exhausted) {
       if (mediumLow.length) {
-        const fin = await agent(fixerPrompt(mediumLow, round, { finalRound: true }), { schema: FIX_RESULT, label: 'final-fix (medium/low)', phase: 'Fix' })
+        const fin = await tryAgent(fixerPrompt(mediumLow, round, { finalRound: true }), { schema: FIX_RESULT, label: 'final-fix (medium/low)', phase: 'Fix' })
         if (fin?.status === 'done') {
           state.fixed.push(...(fin.fixed || []))
           state.diverged.push(...(fin.diverged || []))
@@ -519,7 +573,7 @@ for (let round = 1; round <= effectiveMax; round++) {
 
   // --- Fix Blocker/High + aged Mediums (on the last possible round: full verify) ---
   const assigned = highBlocker.concat(agedMediums.filter((m) => !highBlocker.some((h) => h.id === m.id)))
-  const fix = await agent(
+  const fix = await tryAgent(
     fixerPrompt(assigned, round, {
       finalRound: false,
       mustFullVerify: round === effectiveMax,
@@ -559,7 +613,7 @@ if (finalStatus === 'capped') {
 
   if (claimedFixed.length) {
     // "fixed" is the fixer's claim — bounded validation (1 agent, scope closed to the ids), not a new review.
-    const val = await agent(validationPrompt(claimedFixed, lastFixResult, true), { schema: VALIDATION_RESULT, label: 'fix-validation post-cap', phase: 'Fix' })
+    const val = await tryAgent(validationPrompt(claimedFixed, lastFixResult, true), { schema: VALIDATION_RESULT, label: 'fix-validation post-cap', phase: 'Fix' })
     if (val) {
       const resolvedById = new Map((val.resolved || []).map((r) => [r.id, r.evidence || '']))
       const stillOpenById = new Map((val.stillOpen || []).map((s) => [s.id, s.why]))
@@ -573,12 +627,13 @@ if (finalStatus === 'capped') {
     }
   }
 
-  await agent(cappedCommentPrompt({ open: openHighBlocker, fixedValidated, fixedUnreviewed, contested: contestedUnreviewed }, roundsSummary, pendingGate), { schema: FINDINGS, label: 'capped-comment', phase: 'Conciliate' })
+  await tryAgent(cappedCommentPrompt({ open: openHighBlocker, fixedValidated, fixedUnreviewed, contested: contestedUnreviewed }, roundsSummary, pendingGate), { schema: FINDINGS, label: 'capped-comment', phase: 'Conciliate' })
 }
 
 return {
   status: finalStatus,
   mode,
+  profile: PROFILE,
   rounds: roundsSummary,
   extensionsUsed,
   gateNeverRan: finalStatus === 'capped' && pendingGate,
