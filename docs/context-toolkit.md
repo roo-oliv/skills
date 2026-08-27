@@ -14,9 +14,16 @@ the skills and the docs.
 | [`hooks/deep-plan-pr-gate.sh`](../hooks/deep-plan-pr-gate.sh) | `.claude/hooks/` | blocks a PR on a sensitive branch with no premises read and no complete plan-contract |
 | [`rules/context.md`](../rules/context.md), [`rules/premises.md`](../rules/premises.md) | `.claude/rules/` | the directives an author follows — the charter and the premise format |
 
-`scripts/install.sh` vendors all of it and merges `settings/hooks.json` into the target's `.claude/settings.json`.
+`scripts/install.sh` vendors all of it and merges `settings/hooks.json` and `settings/env.json` into the
+target's `.claude/settings.json`.
 Nothing is stack-specific: every path, glob and ceiling comes from `docs/agents/skills-config.md` in the
 consuming repo (schema: `skills/setup/skills-config.template.md`), with the defaults quoted below.
+
+The installer vendors two more script families that read the same config but answer different questions:
+[`ci/agent_telemetry.py`](../ci/agent_telemetry.py) + [`ci/otel_headers.py`](../ci/otel_headers.py)
+([`docs/telemetry.md`](telemetry.md) — it is what feeds decay signal D3), and
+[`ci/lint_ratchet.py`](../ci/lint_ratchet.py) + [`ci/refactor_ratio.py`](../ci/refactor_ratio.py)
+([`docs/lint-ratchet.md`](lint-ratchet.md)).
 
 ## What the linter checks
 
@@ -116,7 +123,7 @@ one naming signal. Age qualifies; it never names.
 |---|---|
 | D1 `superseded` | a `> **YYYY-MM-DD:** superseded — …` banner in the first 15 lines |
 | D2 `broken-ref` | a C6/C7/C8/C9/C13/C14 finding on the file (**never C10** — what is left of it is framework types by design) |
-| D3 `unloaded` | the telemetry report marks the surface, or one premise of a file that does load, `zero-load` |
+| D3 `unloaded` | the telemetry report ([`docs/telemetry.md`](telemetry.md)) marks the surface, or one premise of a file that does load, `zero-load` |
 | D4 `dated` | an ephemeral doc past the window with no supersession banner |
 | D5 `dead-scope` | a rule whose `paths:` globs match no tracked file — it never loads |
 | D6 `unreachable` | a doc not reachable from the docs index by links or backticked paths |
