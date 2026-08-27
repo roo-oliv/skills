@@ -63,8 +63,8 @@ are universal:
 
 Confirm each by grep, then keep as a column if it reads the affected state: the
 manual/admin write paths, the webhook/event processors, the external-provider
-notification handlers, the manual-correction services, transfer/position/payout
-services, scheduled jobs querying by status, and API response mappers with a
+notification handlers, the manual-correction services, the services that move or
+settle the affected value, scheduled jobs querying by status, and API response mappers with a
 status switch (does the default branch silently miscategorize the new value?).
 
 ### Step 4: the new control field's OWN mutators are row-states
@@ -95,7 +95,7 @@ whether each guard exists in code or is a GAP.
 ### Step 5: attribution-key write-sites are columns
 
 If the new record/lane/state is **keyed by a column copied or snapshotted from
-another entity** (a foreign-key id, a cohort/tenant id, a fixed-FK pin), grep
+another entity** (a foreign-key id, a tenant/batch id, a fixed-FK pin), grep
 every **pre-existing writer of that column** — sync services, repoint endpoints,
 update flows — and emit each as a column. Those writers were built before the
 new reader existed; each must either be extended to cover it, or its

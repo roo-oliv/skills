@@ -56,8 +56,8 @@ Adapt these to the entity's real stages:
    status runs? If so the filter finds nothing (the ordering trap).
 5. **Manual cancellation** — same ordering concerns.
 6. **Born-terminal / fully covered** — completion event published? no orphans?
-7. **Overpayment / duplicate event** — money/event arrives on a
-   canceled/superseded parent carrying the new record.
+7. **Excess / duplicate event** — a second event (a repeat payment, a replayed
+   webhook) arrives on a canceled/superseded parent carrying the new record.
 8. **Periodic/batch run** — does the new record/source need an offset or
    exclusion in the recurring job?
 

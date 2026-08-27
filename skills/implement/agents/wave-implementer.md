@@ -32,7 +32,7 @@ List in `untestedItems` what you could NOT cover (with the reason) — the orche
 
 ## New derived load-bearing quantity = dimension row in the SAME commit
 
-If your wave creates a **derived** load-bearing quantity (monetary or otherwise) that the plan/contract doesn't specify (a subtraction window, a capped accumulator, a proration), that is a design decision, not an implementation detail. Money is the canonical example, but any computed value that flows downstream qualifies. In the same commit:
+If your wave creates a **derived** load-bearing quantity that the plan/contract doesn't specify (a subtraction window, a capped accumulator, a proration), that is a design decision, not an implementation detail. A value in currency is the canonical example, but any computed value that flows downstream qualifies. In the same commit:
 
 - **Retroactive dimension row** in the plan-contract committed on the branch (`.claude/deep-plan/*.md`; strike-don't-append if it replaces an existing row), with the full checklist: row-set scope; election/dedup; **anchor-clock with a consistency proof against the quantity it is subtracted from** (e.g. event-time vs. settlement-time vs. created-time); parent status × lifecycle filters (do CANCELED/SUPERSEDED/RESERVED-equivalent states enter?); cumulative cap.
 - A premise in the premises doc (per Docs layout) with `**Tests:**` filled.

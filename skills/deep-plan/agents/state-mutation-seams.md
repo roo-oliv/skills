@@ -8,10 +8,9 @@ executable, not just documented.
 
 A "seam" is any path that **constructs or transitions the record/quantity the
 change introduces** — and the dangerous ones are the *non-primary* paths a
-planner forgets. The backend's canonical example is the set of paths that create
-settlement records (provider webhooks, manual CSV imports, third-party
-notifications, manual corrections); each distributes money over a base and each
-needs a cap. Your repo's seams are whatever paths write the affected state — read
+planner forgets. A canonical example: the set of paths that create settlement
+records (provider webhooks, manual CSV imports, third-party notifications,
+manual corrections); each distributes a value over a base and each needs a cap. Your repo's seams are whatever paths write the affected state — read
 the **flow docs** (`docs/agents/skills-config.md` › Flows) and the
 domain premises to learn what they are.
 
@@ -27,10 +26,10 @@ domains. No diff — use Read/Grep/Bash to find the real seams.
 ## The sensitive-domain tenet (config-driven)
 
 When the change touches a repo **Sensitive domain** (config › Sensitive
-domains), the seam's invariant is load-bearing and must become executable. The
-backend's governing tenet, as a reference: *payments are exogenous events — we
-register money regardless of entity state and reconcile afterward; multiple
-settlements per invoice happen; we transfer only the custodied amount.* Read
+domains), the seam's invariant is load-bearing and must become executable. One
+repo's governing tenet, as a reference: *incoming payments are exogenous events —
+we register them regardless of entity state and reconcile afterward; multiple
+settlements per invoice happen; we transfer only the amount actually held.* Read
 your repo's equivalent tenet from the core-tenets doc and hold each seam to it.
 If no Sensitive domains are configured, still map the seams, but do not block.
 
@@ -62,8 +61,8 @@ For the entity/quantity the intent introduces, answer per seam:
   debt, balance rollup): when the new record reaches a terminal state, is it
   counted correctly or excluded? Counting a deferred/held amount as if it were
   realized under- or over-states the derived quantity.
-- Any overpayment/double-instrument path: does it handle records carrying the
-  new state correctly?
+- Any excess-payment / double-instrument path: does it handle records carrying
+  the new state correctly?
 
 ### Step 4: cross-check failure modes
 

@@ -6,11 +6,16 @@ premises are protected**.
 ## Your inputs
 
 You receive **Phase 1 context**: the diff, change metadata, the core-tenets doc,
-relevant schema docs, the relevant premises file(s) (one per affected domain,
-when the file exists), the repo's conventions doc, list of changed files, list of
-affected domains. Premises/tenets paths come from **Docs layout**
-(`docs/agents/skills-config.md`); if absent, default to `docs/CORE_TENETS.md` and
-`docs/{domain}/premises.md` and say so.
+relevant schema docs, the premises index of each affected domain, list of
+changed files, list of affected domains.
+
+Premises arrive as the domain's **premises INDEX** (path from **Docs layout › Premises
+index**, `docs/agents/skills-config.md`; default `docs/{domain}/premises-index.md`) — open
+the bodies your lens needs with the configured **premise fetch command** (default
+`python3 .github/scripts/premise.py <id>`), by id, never the whole premises file: the `Read`
+tool truncates at 2000 lines. No index in the repo → read `docs/{domain}/premises.md` and
+say so. Tenets default to `docs/CORE_TENETS.md`. Your lens needs premise
+bodies more than the others do — fetch every premise whose subject the diff touches.
 
 Before judging tests, read the repo's **test conventions** (config › Conventions
 › test conventions — e.g. a pointer to a testing rules doc). Glob-scoped
@@ -60,8 +65,9 @@ test-conventions doc:
 
 ## Part C: Premises validation
 
-For each affected domain, find the corresponding premises file (per **Docs
-layout**).
+For each affected domain, walk its **premises index** (per **Docs layout ›
+Premises index**) and fetch, by id, the body of every premise the diff's subject
+touches — the index line is not enough to judge test protection.
 
 1. **For each stated premise**: verify a test would break if the premise were
    violated. A test that passes regardless of whether the premise holds is not
@@ -76,14 +82,14 @@ layout**).
 4. **Classify missing premise tests as HIGH danger** — premises protect system
    invariants, not just feature correctness.
 
-If no premises file exists for an affected domain, note this. If the changes
+If neither a premises index nor a premises file exists for an affected domain, note this. If the changes
 introduce or depend on invariants, recommend creating one.
 
 ## Output
 
 Use the standard severity-bucket format (Blockers / High / Medium / Low /
 Positive observations). Add a `## Premises notes` section with domain-by-domain
-coverage status (e.g. `billing: 8 premises, all have Tests refs; cohort: file
+coverage status (e.g. `billing: 8 premises, all have Tests refs; catalog: file
 missing`).
 
 If you have NO findings at all, write a single line: `_No findings._`

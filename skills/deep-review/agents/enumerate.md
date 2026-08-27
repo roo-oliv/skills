@@ -38,7 +38,7 @@ Pick the matching type (or combine when the surface spans types).
 3. **Clock / temporal window** — anchor date consistent with every quantity this
    one is compared to or subtracted from; D-1 / business-day / webhook-lag edges.
 4. **Unit, base, cap** — base tagged and dimensionally consistent in every op
-   (for money: face/residual/principal/with-interest/net-of-reserved; for other
+   (for a currency amount: face/residual/principal/with-interest/net-of-reserved; for other
    units: the reference point); cap enforced by an executable assertion at the
    seam; identity checks not self-referential.
 5. **Readers** — every consumer assumes the same scope/clock/base.

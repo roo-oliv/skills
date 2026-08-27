@@ -1,0 +1,70 @@
+# Monthly add:delete tripwire — copy to .github/workflows/refactor-ratio.yml in your repo.
+#
+# NEVER a gate: it measures the add:delete ratio of production code and comments the report on an
+# issue. `refactor_ratio.py` always exits 0 — a bad number is a reason to look, not to break a build
+# (docs/lint-ratchet.md of the skills repo).
+#
+# Before this runs, the repo needs:
+#   - `## Lint ratchet` › **Production globs** in docs/agents/skills-config.md (otherwise it measures
+#     the whole tree and says so);
+#   - a repo variable REFACTOR_RATIO_ISSUE with the issue number to comment on — or a manual run with
+#     the `issue` input.
+name: Refactor ratio
+
+on:
+  schedule:
+    - cron: "0 12 1 * *" # the 1st of each month, 12:00 UTC
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue number to comment the report on (defaults to vars.REFACTOR_RATIO_ISSUE)"
+        required: false
+        type: string
+
+permissions: {}
+
+# Two simultaneous runs (cron + a manual dispatch) would comment twice on the same issue.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Monthly report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout with full history (the report is `git log`)
+      issues: write # the comment on the tripwire issue
+    steps:
+      # Third-party and vendor actions alike are pinned by SHA, with the tag in a comment: a tag is
+      # mutable, and this job has `issues: write`.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The report is `git log` over the last months: a shallow checkout has nothing to measure.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Script tests
+        run: python3 -m unittest discover -s .github/scripts -p 'refactor_ratio_test.py'
+
+      - name: Generate the report
+        run: |
+          python3 .github/scripts/refactor_ratio.py > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # A closed, locked or renumbered issue must not fail the job: the report is already in the step
+      # summary. A diagnostic step never breaks the build.
+      - name: Comment on the tripwire issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TRIPWIRE_ISSUE: ${{ inputs.issue || vars.REFACTOR_RATIO_ISSUE }}
+        run: |
+          if [ -z "$TRIPWIRE_ISSUE" ]; then
+            echo "> No issue configured (vars.REFACTOR_RATIO_ISSUE) — the report is above." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh issue comment "$TRIPWIRE_ISSUE" --body-file report.md \
+            || echo "> Comment on issue #$TRIPWIRE_ISSUE failed (closed? locked?) — the report is above." >> "$GITHUB_STEP_SUMMARY"

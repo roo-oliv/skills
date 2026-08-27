@@ -7,17 +7,22 @@ review.
 ## Your inputs
 
 You receive **Phase 1 context**: the diff, change metadata, the core-tenets doc,
-relevant schema/premises docs, the repo's conventions doc, list of changed
-files, list of affected domains. Premises/tenets paths come from **Docs layout**
-(`docs/agents/skills-config.md`); if absent, default to `docs/CORE_TENETS.md` and
-`docs/{domain}/premises.md` and say so. Detect a changed file's domain via
-**Domains** (`docs/agents/skills-config.md` — path-glob → domain).
+relevant schema docs, the affected domains' premises indices, list of changed
+files, list of affected domains. Detect a changed file's domain via **Domains**
+(`docs/agents/skills-config.md` — path-glob → domain).
+
+Premises arrive as the domain's **premises INDEX** (path from **Docs layout › Premises
+index**, `docs/agents/skills-config.md`; default `docs/{domain}/premises-index.md`) — open
+the bodies your lens needs with the configured **premise fetch command** (default
+`python3 .github/scripts/premise.py <id>`), by id, never the whole premises file: the `Read`
+tool truncates at 2000 lines. No index in the repo → read `docs/{domain}/premises.md` and
+say so. Tenets default to `docs/CORE_TENETS.md`.
 
 If you have file-access tools (Read, Grep): use them liberally — your job
 demands exhaustive search across the codebase. Scope grep with `rg` to the repo
 root. If you do NOT have those tools (e.g. a static-prompt environment), reason
-from the embedded diff plus the project conventions in the repo's conventions
-doc, and flag predicted-affected sites as "verify" findings.
+from the embedded diff plus the repo's conventions (config › Conventions and the
+rules dir it points at), and flag predicted-affected sites as "verify" findings.
 
 **Execute this checklist systematically. Do every step — do not skip.**
 
@@ -91,14 +96,14 @@ Detected from the affected domains — the canonical broad-blast-radius sites:
 - Scheduled jobs querying by status
 - Response mappers — `when`/`switch` on enums: does the `else`/`default` branch
   silently miscategorize?
-- Transfer/payout-equivalent or proportion calculations — do bounded values stay
+- Transfer/disbursement-equivalent or proportion calculations — do bounded values stay
   inside their bound (e.g. a proportion in [0.0, 1.0])?
 
 ## Step 6: Check the inverse
 
 Does the new code handle all EXISTING scenarios? If a new method filters by
 status, does it account for ALL possible states (including the
-overpayment/cancellation/expiration-equivalent edge states of this domain)?
+excess-event / cancellation / expiration-equivalent edge states of this domain)?
 
 ## Output format
 

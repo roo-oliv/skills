@@ -10,7 +10,7 @@ sensitive: <true|false>   # optional — is a mistake in this flow expensive/irr
 
 # <Flow name>
 
-<One or two paragraphs describing the flow as it actually is — the path data / state / money
+<One or two paragraphs describing the flow as it actually is — the path data / state / value
 takes through the system, start to end. Write it like a core-tenet for this flow: declarative
 and explanatory, NOT a list of "check that…" instructions. This is the shared mental model a
 reviewer loads before judging any change to the flow. The lens derives its own questions from
@@ -32,7 +32,7 @@ test could break if it were violated. These are the premises specific to this fl
 
 ## Load-bearing quantities
 
-<For flows that compute or move a value (money, counts, coordinates, timing): each value, what
+<For flows that compute or move a value (currency, counts, coordinates, timing): each value, what
 it is, its unit/base, and its cap. This is what the derived-quantity lens leans on. Omit the
 section if the flow carries no such quantity.>
 
