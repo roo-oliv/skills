@@ -4,7 +4,7 @@ description: "Turns a raw request (free text, a plan file, or a link — GitHub 
 argument-hint: "[free text | plan file path | issue/PR/Jira/Slack URL]"
 ---
 
-`refine` is the planning step of the `refine → implement → review-fix-loop` pipeline, but it works standalone. It takes an intent in any format, resolves the content, decides whether it needs to interview the user, writes a plan with the plan-contract artifacts, **decides on its own** whether the risk justifies running `/deep-plan`, and only then returns to the user for final approval. The output is a plan file stamped APPROVED — exactly the input `/implement` consumes.
+`refine` is the planning step of the `refine → implement → review-fix-loop` pipeline, but it works standalone. It takes an intent in any format, resolves the content, decides whether it needs to interview the user, writes the three planning artifacts (`intent.md` / `spec.md` / `plan.md`, following the [AI-native SDLC playbook](https://claude.com/blog/the-ai-native-sdlc-playbook)), **decides on its own** whether the risk justifies running `/deep-plan`, and only then returns to the user for final approval. The output is a `plan.md` stamped `approved`, carrying the Contract block — exactly the input `/implement` consumes.
 
 This skill runs **inline in the main conversation** (it needs `AskUserQuestion`); it does not dispatch a Workflow directly — at most it invokes `/deep-plan`, which has its own Workflow.
 
@@ -44,15 +44,25 @@ For every scenario the plan decides to **defer** ("out of scope", "we handle it 
 
 If the brief is unambiguous, **say so in one line and proceed** — don't fabricate questions. The deep-plan self-critique paradox applies here: ceremony on a simple task teaches the user to ignore the skill.
 
-## Phase 3 — Author the plan
+## Phase 3 — Author the artifacts
 
-Write the plan following the plan-contract spec from **Docs layout** (`docs/agents/skills-config.md` › Planning › plan-contract spec). If config lists no plan-contract spec, default to the canonical four artifacts described below and say so.
+Write three files under `<intent dir>/<slug>/` (config › **Intent** › Intent dir; default `intent/`, `<slug>` = the kebab slug of the change). Each stage commits an artifact the next stage can read:
+
+| File | Phase | Contents |
+|---|---|---|
+| `intent.md` | Plan | **In the originator's voice**, not yours: Problem / Proposed outcome / Affected users and systems / Constraints / Open questions. Where the request came from (link/file) goes here verbatim. |
+| `spec.md` | Design | Requirements and design with this repo's policies applied — chosen approach, discarded alternatives with 1 line of why each, the invariants and premises it leans on. |
+| `plan.md` | Build | The implementation plan — files, order, risks, proof — **and the `## Contract` block**. This is the file `/implement` and `/verify-plan` read. |
+
+Each file's header carries `**Status:** draft` (→ `approved` at Phase 6 → `implemented` by `/implement`). If the config has no Intent section, fall back to a single gitignored `<repoRoot>/.claude/.plans/<slug>.md` holding all three sections, and **say so**.
+
+`plan.md` follows the plan-contract spec from **Docs layout** (config › Planning › plan-contract spec). If config lists no plan-contract spec, default to the canonical four artifacts described below and say so.
 
 - **Prose**: context, chosen approach (and discarded alternatives, with 1 line of why each), implementation phases if multi-phase.
 - **`## Code map`** (whenever Phase 1 dispatched Explore agents): the `file:line` seams the agents mapped — the central method of each touched flow, existing guards/gates, callers, the tests that cover the flow today. This map is the pipeline's **case file**: `/implement`'s waves and the review loop's bounded agents (fixer, validator, enumerator) navigate by it instead of re-mapping the codebase from scratch — every stage that re-discovers the same file:line pays the search phase again. It deliberately does NOT feed the breadth reviewers (the fresh-eyes lenses): the map is the author's view, and feeding it to clean eyes anchors exactly the look that exists in order not to anchor.
 - **`## Contract`** (always): a flat numbered list of atomic, individually verifiable commitments.
 - **Interaction matrix** and **Precondition diff**: when the plan-contract triggers apply (new entity status/lifecycle, state machine, long-lived RESERVED/PENDING record; deleted/replaced method/flow or copied guard).
-- **Metadata header** at the top of the file:
+- **Metadata header** at the top of `plan.md`:
 
 ```markdown
 # {title}
@@ -61,12 +71,14 @@ Write the plan following the plan-contract spec from **Docs layout** (`docs/agen
 **Suggested branch:** {type}/{kebab-slug}   ← follow the commit/PR conventions from config › Conventions
 **Domains:** {list}
 **Risk tier:** {direct | deep-plan (reduced — single refutation) | deep-plan} — {1-line justification}
-**Status:** DRAFT
+**Status:** draft
 ```
+
+`intent.md` and `spec.md` carry the same `**Status:**` line and a pointer back to the sibling files.
 
 The Contract block, interaction matrix, and precondition diff are the domain-agnostic planning artifacts (also referenced by `/deep-plan` and `/verify-plan`): the Contract is the checklist later reconciled against the implementation; the matrix is new-status × adjacent-entity-event with each cell `handled`/`N/A`/`GAP`; the precondition diff covers every copy of a touched guard.
 
-Save to `<repoRoot>/.claude/.plans/<kebab-slug>.md` (repo-local; auto-ignored by `.gitignore` via `.claude/*` — not versioned). This is the repo-local directory that `/verify-plan` (Phase 0) and the deep-plan PR gate scan, with a fallback to the global `~/.claude/plans/`. If the session's plan mode blocks the Write, present the plan in the conversation and write the file right after the Phase 6 approval.
+The intent dir is **versioned** — unlike a gitignored scratch plan, these artifacts are committed beside the code they produce, and `git` carries their revision history. Keep the dir out of any published docs tree (a draft is not documentation). If the session's plan mode blocks the Write, present the plan in the conversation and write the files right after the Phase 6 approval.
 
 ## Phase 4 — Illustrate critical outcomes (judgment)
 
@@ -92,12 +104,12 @@ Regardless of tier, **return to the user** with `AskUserQuestion`:
 - Plan summary in ≤10 lines: what changes, contract size, risk tier, residual deep-plan GAPs (if any), suggested branch.
 - Options: **Approve** / **Adjust** (collect the adjustment, return to Phase 3) / **Cancel**.
 
-On approval, update the header to `**Status:** APPROVED — refine {date}` and finish by reporting:
+On approval, update each file's header to `**Status:** approved — refine {date}` and finish by reporting:
 
 ```
-Plan approved: .claude/.plans/<slug>.md
+Plan approved: <intent dir>/<slug>/plan.md   (intent.md + spec.md alongside it)
 Suggested branch: <type>/<slug>
-Next step: /implement .claude/.plans/<slug>.md
+Next step: /implement <intent dir>/<slug>/plan.md
 ```
 
 Write the branch and commit/PR language using the conventions from `docs/agents/skills-config.md` › Conventions (Conventional Commits, branch naming). When invoked **by `/implement`**, this approval already counts as the final confirmation — implement does not ask again.

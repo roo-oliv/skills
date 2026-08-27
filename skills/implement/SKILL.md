@@ -20,7 +20,7 @@ This skill reads the repo's `docs/agents/skills-config.md` for its stack-specifi
 
 ## Step 2 — Secure an APPROVED plan
 
-1. If the input is a path to a plan with `**Status:** APPROVED` (or a plan approved **in this session** via refine/plan mode) → use it.
+1. If the input is a path to a plan with `**Status:** approved` (typically `<intent dir>/<slug>/plan.md` — config › Intent, default `intent/`), or a plan approved **in this session** via refine/plan mode → use it. Read its sibling `intent.md` and `spec.md` if they exist: they carry the originator's framing and the design decisions the Contract compresses.
 2. Otherwise (text, URL, DRAFT plan, or nothing) → **invoke the `refine` skill** (Skill tool) with the input. Refine interviews if needed, decides deep-plan vs. direct, and ends with the user's final approval — that approval is the confirmation to implement; don't ask again.
 3. If refine ends in Cancel, stop.
 
@@ -65,7 +65,7 @@ The workflow runs in the background; wait for the `<task-notification>`. Track v
 
 Read the result and report to the user **leading with the outcome**:
 
-- `status: "pr-opened"` → PR URL, waves executed, commits, and the **Autonomous decisions** section (each point where a user input would have been requested: options considered + chosen path + why — also present in the PR description for the user to review and request changes).
+- `status: "pr-opened"` → stamp the plan's artifacts `**Status:** implemented` (all three files under the intent dir, in a commit on the branch), then report the PR URL, waves executed, commits, and the **Autonomous decisions** section (each point where a user input would have been requested: options considered + chosen path + why — also present in the PR description for the user to review and request changes).
 - `status: "pr-unconfirmed"` → the PR agent died **at the report step**, not necessarily at the work (rebase/push/`gh pr create` run before it). Check `gh pr view --head <branch>`: if the PR exists, proceed as `pr-opened`; if not, the ledger says where it stopped — re-launch the workflow (Setup detects the resume from the ledger and skips completed waves). **Never re-run from scratch without checking** — that false negative is exactly what this status exists to prevent.
 - `status: "blocked" | "verify-failed" | "blocked-gate"` → what was committed/pushed so far, the blocked wave/step and the reason. Do **not** chain the review. If it's `blocked-gate` (a deep-plan gate hook blocked `gh pr create`), the path is to complete the plan-contract — never instruct the override token.
 

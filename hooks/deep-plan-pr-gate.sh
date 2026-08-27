@@ -121,11 +121,13 @@ if [ -d "$PROJECT_DIR/.claude/deep-plan" ]; then
   done
 fi
 
-# 5b. Session plans describing THIS branch's change. Repo-local .claude/.plans/ first
-# (where /refine writes; gitignored), then the global ~/.claude/plans/. "Belongs" means
-# the plan references a file this branch actually changes.
+# 5b. Plans describing THIS branch's change. The versioned intent dir first (where
+# /refine writes <slug>/plan.md; override the dir with DEEP_PLAN_INTENT_DIR), then the
+# gitignored repo-local .claude/.plans/, then the global ~/.claude/plans/. "Belongs"
+# means the plan references a file this branch actually changes.
 scan_plans_dir() {
   local plans_dir="$1"
+  local glob="${2:-*.md}"
   [ -d "$plans_dir" ] || return 0
   while IFS= read -r f; do
     [ -e "$f" ] || continue
@@ -138,9 +140,10 @@ scan_plans_dir() {
     [ "$belongs" -eq 1 ] || continue
     checked=$((checked+1))
     if is_complete_contract "$f"; then found_complete=1; return 0; fi
-  done < <(ls -t "$plans_dir"/*.md 2>/dev/null | head -10)
+  done < <(ls -t "$plans_dir"/$glob 2>/dev/null | head -10)
 }
 
+[ "$found_complete" -eq 0 ] && scan_plans_dir "$PROJECT_DIR/${DEEP_PLAN_INTENT_DIR:-intent}" "*/plan.md"
 [ "$found_complete" -eq 0 ] && scan_plans_dir "$PROJECT_DIR/.claude/.plans"
 [ "$found_complete" -eq 0 ] && scan_plans_dir "$HOME/.claude/plans"
 
