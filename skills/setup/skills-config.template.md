@@ -40,6 +40,8 @@ the skill substitutes per change.
 - **Premises index** (optional but recommended): `<pattern>`  <!-- default: docs/{domain}/premises-index.md -->
 - **Premise fetch command** (optional): `<command with a <id> placeholder>`
   <!-- default: python3 .github/scripts/premise.py <id> -->
+- **Premises index write command** (optional): `<command>`
+  <!-- default: python3 .github/scripts/context_lint.py --write-indices — named in every generated index header -->
 - **Schema** (optional): `<pattern>`  <!-- e.g. backend: docs/schema/{domain}.md -->
 - **Planning** (optional): plan-contract spec `<path>`; recurring-failure-modes `<path>`; plan-contract glob `<glob>`
   <!-- e.g. backend: docs/planning/plan-contract.md, docs/planning/recurring-failure-modes.md, .claude/deep-plan/*.md -->
@@ -56,6 +58,40 @@ and a fenced ```` ```json review-exclusions ```` block at the end listing findin
 must never post (`{ id, pattern, precedent, why }`, matched case-insensitively against a finding's
 title+description). `/review-fix-loop` extracts that block in preflight and drops matching findings in
 code, before any judge sees them.
+
+## Context toolkit
+
+Optional — read by the vendored scripts under `.github/scripts/` (`context_lint.py`, `context_decay.py`,
+`premise.py`) and by the context hooks. Every value below has a working default, and the two **stack-specific
+checks are OFF until you fill them in**: no `Source globs` means the symbol check (C10) never runs, no
+`Migration dirs` means the migration check (C9) never runs. Full check table: the context-toolkit doc of the
+skills repo (docs/context-toolkit.md there — it is not a file of this repo).
+
+- **Agent instructions file:** `<path>`  <!-- default: CLAUDE.md; AGENTS.md if that is what your harness reads -->
+- **Skills dir:** `<path>`  <!-- default: .claude/skills/ -->
+- **Docs root:** `<path>`  <!-- default: docs/ -->
+- **Docs index:** `<path>`  <!-- default: docs/index.md — the root of the reachability walk (decay signal D6) -->
+- **Ephemeral docs:** `<glob>, <glob>`
+  <!-- default: docs/work/** — dated, never updated; not a lint surface, and the only input to decay signal D4 -->
+- **Never a surface:** `<glob>, <glob>`  <!-- default: .claude/deep-plan/**, **/eval/** -->
+- **Source globs:** `<glob>, <glob>`
+  <!-- the files whose PascalCase names vouch for a backticked symbol. e.g. *.kt, *.kts, *.yml, *.js | *.ts, *.tsx
+       | *.cs. Leave empty to keep C10 off. NEVER include *.sql or *.md: a commented-out statement or another doc
+       would vouch for a symbol the code no longer has. -->
+- **Migration dirs:** `<dir>, <dir>`  <!-- e.g. db/migration, db/data. Empty keeps C9 off. -->
+- **Migration version pattern** (optional): `<regex>`  <!-- default: \bV[0-9]{2,3}(?:__[a-z0-9_]+\.[a-z]+)?\b -->
+- **Path resolution roots** (optional): `<dir>, <dir>`
+  <!-- extra prefixes a backticked path may be relative to, e.g. src/main/resources — before this list a path
+       resolves from the repo root, from the citing doc's folder, or by unique suffix -->
+
+| Ceiling | Value |
+|---|---|
+| agent instructions lines | 200 |
+| always on bytes | 32768 |
+| rule lines | 150 |
+| premise lines | 40 |
+| premise bytes | 4096 |
+| premise warn lines | 25 |
 
 ## Intent
 
@@ -106,10 +142,16 @@ The bounded contexts / domains of this repo, and how to detect which one a chang
 belongs to (path globs → domain). Skills use this to load the right premises and lenses.
 If you don't partition by domain, write a single `default` row matching everything.
 
-| Domain | Detect (path globs) |
-|---|---|
-| `<name>` | `<glob>`, `<glob>` |
-<!-- e.g. backend: billing | **/billing/** ;  monodreams: rendering | MonoDreams/*/Draw/**, MonoDreams/Renderer/** -->
+| Domain | Detect (path globs) | Prompt terms (optional) |
+|---|---|---|
+| `<name>` | `<glob>`, `<glob>` | `<word>`, `<word>` |
+<!-- e.g. backend: billing | **/billing/** | invoices, dunning ;  monodreams: rendering | MonoDreams/*/Draw/** | -->
+
+**Prompt terms** are the extra words that name the domain in a prompt or a query — a synonym, a term in another
+language, a table name. The context hooks use them to put the domain's premises index on the *reasoning* path
+(a prompt naming the domain, a SQL query naming one of its tables), which `paths:` rules cannot reach because
+they only fire when a file is read or edited. A sensitive domain also fires on its own bare name; a
+non-sensitive one only on an explicit term. Leave the column empty to opt out.
 
 ## Sensitive domains
 

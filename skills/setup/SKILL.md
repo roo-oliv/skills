@@ -49,14 +49,20 @@ The sections (full schema + per-repo examples in [skills-config.template.md](./s
   Under **Planning**, record the plan-contract spec, the plan-contract glob, and the
   recurring-failure-modes doc — the last one also carries the `review-exclusions` block the review
   loop reads.
+- **Context toolkit** — optional; only ask if the repo vendors the `ci/` scripts (`context_lint.py`,
+  `context_decay.py`, `premise.py`). Everything defaults, but two checks stay OFF until answered:
+  **Source globs** (which file types vouch for a backticked symbol — never `*.sql` or `*.md`) and
+  **Migration dirs**. Also ask whether the instructions file is `CLAUDE.md` or `AGENTS.md`, and leave the
+  ceilings table at its defaults unless the user objects.
 - **Intent** — the directory holding each unit of work's `intent.md` / `spec.md` / `plan.md`
   (default `intent/`). Keep it out of any published docs tree. `bootstrap` writes its README.
 - **Models** — optional per-role model/effort overrides (`decision`, `worker`, `fixer`,
   `fix-review`, `pr-author`). Only ask if the user wants to deviate; explain that `fix-review` must
   name a different model from `fixer`, and that `CLAUDE_CODE_SUBAGENT_MODEL` must never be set
   because it overrides the whole table.
-- **Domains** — the bounded contexts and a path-glob → domain map. If the repo isn't
-  partitioned, a single `default` row is fine.
+- **Domains** — the bounded contexts and a path-glob → domain map, plus the optional **prompt terms**
+  column (synonyms, other-language words, table names) the context hooks match against a prompt or a
+  query. If the repo isn't partitioned, a single `default` row is fine.
 - **Sensitive domains** — the subset where mistakes are expensive/irreversible (value movement,
   data loss, security, safety). This is the single most important answer: it decides when the heavy
   deep-plan/deep-review path and the PR gate fire. **Empty is a valid answer** — say so.
