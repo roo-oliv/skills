@@ -115,6 +115,19 @@ class TemplateTest(unittest.TestCase):
         )["s"]
         self.assertEqual("<path>", section.bullets["docs root"])
 
+    def test_a_value_carrying_a_colon_survives_all_three_bullet_spellings(self) -> None:
+        # A URL is the case that broke: splitting on ANY colon turned `https://x` into `//x`.
+        section = skills_config.parse_sections(
+            "## S\n"
+            "\n"
+            "- **Endpoint:** `https://otlp.example.com`\n"
+            "- **Other**: `https://other.example.com`\n"
+            "- **Third** (optional): `https://third.example.com`\n"
+        )["s"]
+        self.assertEqual("https://otlp.example.com", section.bullets["endpoint"])
+        self.assertEqual("https://other.example.com", section.bullets["other"])
+        self.assertEqual("https://third.example.com", section.bullets["third"])
+
 
 class FilledTest(unittest.TestCase):
     def setUp(self) -> None:

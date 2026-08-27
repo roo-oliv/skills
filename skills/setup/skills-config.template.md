@@ -93,6 +93,42 @@ skills repo (docs/context-toolkit.md there — it is not a file of this repo).
 | premise bytes | 4096 |
 | premise warn lines | 25 |
 
+## Telemetry
+
+Optional — read by `otel_headers.py` and by `scripts/install.sh` when it merges the `env` block into
+`.claude/settings.json`. **Datadog is the one example measured**, not a default: any OTLP intake works.
+Full setup, attributes and example queries: the telemetry doc of the skills repo (docs/telemetry.md there
+— it is not a file of this repo).
+
+- **Endpoint:** `<url>`  <!-- default: http://localhost:4318 (a collector or vendor agent on the machine) -->
+- **Protocol:** `<http/protobuf | http/json>`
+  <!-- default: http/protobuf. gRPC cannot carry the dynamic auth header the helper prints. -->
+- **Resource attributes** (optional): `<k=v,k=v>`  <!-- default: repo=<the repo directory name> -->
+- **Key variable:** `<NAME>`
+  <!-- default: CLAUDE_CODE_OTEL_API_KEY — a GitHub Actions *variable*, not a secret: a secret is
+       write-only and no `gh` command reads its value back. Use an intake-only key. -->
+- **Key header:** `<header>`  <!-- default: dd-api-key; `Authorization` for a bearer intake -->
+- **Key repo** (optional): `<owner/name>`  <!-- default: whatever `gh` infers from the checkout -->
+
+## Lint ratchet
+
+Optional — read by `lint_ratchet.py` and `refactor_ratio.py`. **Both gates are OFF until `Production
+globs` is filled in.** The idea (gate the delta, never the absolute; the baseline freezes the legacy;
+loosening a threshold is its own PR) is in the lint-ratchet doc of the skills repo. Detekt + PMD/CPD is
+the worked example; ESLint bulk suppressions and Sonar's clean-as-you-code are the same shape.
+
+- **Production globs:** `<glob>, <glob>`
+  <!-- e.g. */src/main/kotlin/*.kt | src/*.ts | */Assets/Scripts/*.cs. `*` crosses `/` (fnmatch, and
+       git's own pathspec matching), so the trailing *.kt already covers every subpackage. Never `**`. -->
+- **Lint config files** (optional): `<path>, <path>`
+  <!-- the files whose thresholds may not loosen in a feature PR. e.g. config/detekt/detekt.yml -->
+- **Baseline files** (optional): `<glob>, <glob>`
+  <!-- the committed suppression baselines. e.g. config/detekt/baseline-*.xml -->
+- **Baseline entry pattern** (optional): `<regex>`
+  <!-- default: <ID> (a detekt baseline). One entry per line instead? Use (?m)^\s*\S -->
+- **CPD command** (optional): `<command>`  <!-- e.g. ./gradlew cpd — named in the error when the report is missing -->
+- **CPD report** (optional): `<path>`  <!-- default: build/reports/cpd/cpd.xml (PMD 6 or 7) -->
+
 ## Intent
 
 Where the pipeline's planning artifacts live. Following the

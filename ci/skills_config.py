@@ -46,6 +46,15 @@ DEFAULTS = {
     "source_globs": [],
     "migration_dirs": [],
     "migration_pattern": r"\bV[0-9]{2,3}(?:__[a-z0-9_]+\.[a-z]+)?\b",
+    # Telemetry. The endpoint default is the OTLP one (a collector or vendor agent on the machine);
+    # a hosted intake goes in the config. The header default is Datadog's, the one example measured.
+    "otel_endpoint": "http://localhost:4318",
+    "otel_protocol": "http/protobuf",
+    "otel_key_variable": "CLAUDE_CODE_OTEL_API_KEY",
+    "otel_key_header": "dd-api-key",
+    # Lint ratchet. Both gates are OFF until the repo names its production globs.
+    "baseline_entry_pattern": "<ID>",
+    "cpd_report": "build/reports/cpd/cpd.xml",
 }
 
 CEILINGS = {
@@ -135,8 +144,14 @@ def parse_sections(text: str) -> dict[str, Section]:
         bullet = BULLET_RE.match(line)
         if bullet:
             label = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", bullet.group("label").lower())).strip()
-            rest = bullet.group("rest")
-            value = rest.split(":", 1)[1] if ":" in rest else rest
+            # Three spellings reach here: `**Label:** value` (colon inside the bold),
+            # `**Label**: value`, and `**Label** (optional): value`. Only a LEADING annotation and a
+            # LEADING colon are separators — splitting on any colon would eat the scheme of a URL
+            # (`https://…`) or half of a `key=value:pair`.
+            rest = bullet.group("rest").lstrip()
+            if rest.startswith("(") and ")" in rest:
+                rest = rest[rest.index(")") + 1 :].lstrip()
+            value = rest[1:] if rest.startswith(":") else rest
             if label and label not in current.bullets:
                 current.bullets[label] = _clean(value)
             last_label = label if label in current.bullets else None
@@ -249,6 +264,18 @@ class Config:
     source_globs: list[str] = field(default_factory=list)
     migration_dirs: list[str] = field(default_factory=list)
     migration_pattern: str = DEFAULTS["migration_pattern"]
+    otel_endpoint: str = DEFAULTS["otel_endpoint"]
+    otel_protocol: str = DEFAULTS["otel_protocol"]
+    otel_resource_attributes: str | None = None
+    otel_key_variable: str = DEFAULTS["otel_key_variable"]
+    otel_key_header: str = DEFAULTS["otel_key_header"]
+    otel_key_repo: str | None = None
+    lint_config_files: list[str] = field(default_factory=list)
+    baseline_globs: list[str] = field(default_factory=list)
+    baseline_entry_pattern: str = DEFAULTS["baseline_entry_pattern"]
+    production_globs: list[str] = field(default_factory=list)
+    cpd_command: str | None = None
+    cpd_report: str = DEFAULTS["cpd_report"]
     domains: list[Domain] = field(default_factory=list)
     sensitive: list[str] = field(default_factory=list)
     ceilings: dict[str, int] = field(default_factory=lambda: dict(CEILINGS))
@@ -338,6 +365,8 @@ def load(repo: str = ".", path: str | None = None) -> Config:
     _read_docs_layout(config, sections.get("docs layout"))
     _read_toolkit(config, sections.get("context toolkit"))
     _read_intent(config, sections.get("intent"))
+    _read_telemetry(config, sections.get("telemetry"))
+    _read_lint_ratchet(config, sections.get("lint ratchet"))
     _read_flows(config, sections.get("flows"))
     _read_domains(config, sections.get("domains"))
     _read_sensitive(config, sections.get("sensitive domains"))
@@ -413,6 +442,45 @@ def _read_intent(config: Config, section: Section | None) -> None:
     value = _bullet(section, "intent dir")
     if value:
         config.intent_dir = value.rstrip("/")
+
+
+def _read_telemetry(config: Config, section: Section | None) -> None:
+    """`## Telemetry` — the OTLP destination and where the auth key is read from. Datadog is one example."""
+    if section is None:
+        return
+    for attr, labels in (
+        ("otel_endpoint", ("endpoint",)),
+        ("otel_protocol", ("protocol",)),
+        ("otel_resource_attributes", ("resource attributes",)),
+        ("otel_key_variable", ("key variable",)),
+        ("otel_key_header", ("key header",)),
+        ("otel_key_repo", ("key repo",)),
+    ):
+        value = _bullet(section, *labels)
+        if value:
+            setattr(config, attr, value.rstrip("/") if attr == "otel_endpoint" else value)
+
+
+def _read_lint_ratchet(config: Config, section: Section | None) -> None:
+    """`## Lint ratchet` — which files are the ratchet, which files are production, how to read a baseline."""
+    if section is None:
+        return
+    for attr, labels in (
+        ("lint_config_files", ("lint config files", "lint config")),
+        ("baseline_globs", ("baseline files", "baselines")),
+        ("production_globs", ("production globs", "production")),
+    ):
+        value = _bullet(section, *labels)
+        if value:
+            setattr(config, attr, _split_list(value))
+    for attr, labels in (
+        ("baseline_entry_pattern", ("baseline entry pattern",)),
+        ("cpd_command", ("cpd command",)),
+        ("cpd_report", ("cpd report",)),
+    ):
+        value = _bullet(section, *labels)
+        if value:
+            setattr(config, attr, value)
 
 
 def _read_flows(config: Config, section: Section | None) -> None:

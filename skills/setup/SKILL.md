@@ -56,6 +56,12 @@ The sections (full schema + per-repo examples in [skills-config.template.md](./s
   ceilings table at its defaults unless the user objects.
 - **Intent** — the directory holding each unit of work's `intent.md` / `spec.md` / `plan.md`
   (default `intent/`). Keep it out of any published docs tree. `bootstrap` writes its README.
+- **Telemetry** — optional; only ask if the repo vendors `otel_headers.py` and wants OTLP export.
+  Everything defaults (endpoint `http://localhost:4318`, `http/protobuf`, variable
+  `CLAUDE_CODE_OTEL_API_KEY`, header `dd-api-key`). What to explain: the key comes from a GitHub
+  Actions **variable**, not a secret, and with no key the session simply exports nothing.
+- **Lint ratchet** — optional; only ask if the repo has a lint config and a suppression baseline worth
+  freezing. **Production globs** is the one that arms both gates; without it they skip and pass.
 - **Models** — optional per-role model/effort overrides (`decision`, `worker`, `fixer`,
   `fix-review`, `pr-author`). Only ask if the user wants to deviate; explain that `fix-review` must
   name a different model from `fixer`, and that `CLAUDE_CODE_SUBAGENT_MODEL` must never be set
