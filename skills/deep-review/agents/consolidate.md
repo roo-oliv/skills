@@ -62,7 +62,7 @@ field; in markdown output, append a `_Surface:_` line to the finding.
 
 ## Step 3: Classify
 
-- **🚨 BLOCKER** — Loss/corruption of money or state, or broken core flow, in a
+- **🚨 BLOCKER** — Loss/corruption of value or state, or broken core flow, in a
   **Sensitive domain** (config › Sensitive domains); also any data corruption or
   broken core flow regardless of domain. Must fix before merge.
 - **⚠️ HIGH** — Significant risk but not immediately exploitable, or fragile code

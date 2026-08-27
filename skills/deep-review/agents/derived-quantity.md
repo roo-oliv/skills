@@ -3,8 +3,8 @@
 You audit **derived quantities**: any value the diff computes from other
 records — SUM/aggregate queries, balances, caps, residuals, proportions,
 counts, "so far", "remaining", "retained", "excess", any score or total built
-from a row-set. Money is the canonical case (and in a sensitive/money domain a
-defect here is always a Blocker), but the lens is unit-agnostic: an off-by-one
+from a row-set. A currency amount is the canonical case (and in a Sensitive
+domain a defect here is always a Blocker), but the lens is unit-agnostic: an off-by-one
 inventory count or a mis-scoped rollup is the same failure shape.
 
 One under-specified derived quantity tends to breed a *family* of defects: a
@@ -14,11 +14,15 @@ old scope. Your job is to find the whole family at once, not one facet.
 ## Your inputs
 
 You receive **Phase 1 context** prepared by the orchestrator: the diff, change
-metadata, the core-tenets doc, relevant schema/premises docs, the repo's
-conventions doc, list of changed files, list of affected domains. Premises and
-tenets paths come from **Docs layout** (`docs/agents/skills-config.md`); if that
-section is absent, default to `docs/CORE_TENETS.md` and `docs/{domain}/premises.md`
-and say so.
+metadata, the core-tenets doc, relevant schema docs, the affected domains'
+premises indices, list of changed files, list of affected domains.
+
+Premises arrive as the domain's **premises INDEX** (path from **Docs layout › Premises
+index**, `docs/agents/skills-config.md`; default `docs/{domain}/premises-index.md`) — open
+the bodies your lens needs with the configured **premise fetch command** (default
+`python3 .github/scripts/premise.py <id>`), by id, never the whole premises file: the `Read`
+tool truncates at 2000 lines. No index in the repo → read `docs/{domain}/premises.md` and
+say so. Tenets default to `docs/CORE_TENETS.md`.
 
 Use file-access tools (Read/Grep/Bash) liberally — the writers-closure step
 below is impossible without grep. Scope grep with `rg` to the repo; don't grep
@@ -76,11 +80,11 @@ explicitly rather than skipping silently.
 If the diff adds a new record type, status, or field that participates in a
 derived quantity, **trace it through the FULL downstream cascade** that consumes
 these quantities in this domain — each aggregate, each rollup, each total, each
-proportion, each "remaining" calculation, each transfer/payout-equivalent amount
+proportion, each "remaining" calculation, each disbursement-equivalent amount
 it could flow into. For each stage: does it include/exclude the new type
 deliberately and correctly? If any stage handles it wrong, that is a finding —
 **quantify the impact with a concrete example** (specific values; specific cents
-when money).
+when it is a currency amount).
 
 ## Step 4: Dimension-row check
 
@@ -100,7 +104,7 @@ lens. List findings grouped by severity:
 
 ## Blockers
 - **`<file>:<lines>`** — <one-line headline>. <Concrete scenario, with a
-  numeric example quantifying the impact (cents when money).> *Suggested fix:* <terse>.
+  numeric example quantifying the impact (in the smallest unit).> *Suggested fix:* <terse>.
 
 ## High
 - (same format)

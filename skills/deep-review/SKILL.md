@@ -11,7 +11,7 @@ Perform a thorough code review. Accepts flexible input:
 - `/deep-review feat/my-branch` — review a branch against origin/main
 - `/deep-review abc1234` — review a single commit
 
-Append `cheaper` (aliases: `cheap`, `simple`, `eco`, `economy`) to use tiered model routing for token efficiency. Default is all-Opus.
+Append `full` to run every lens on the decision tier; the default is the tiered **economy** routing below. `full` also switches on by itself when the change carries a plan-contract on the branch or touches a **Sensitive domain** (`docs/agents/skills-config.md` › Sensitive domains). Append `post` (PR mode) to publish without asking — for non-interactive runs.
 
 This skill reads per-repo configuration from `docs/agents/skills-config.md` (written by the `setup` skill) — stack, verify command, docs layout, domains, sensitive domains, flows, conventions. It hardcodes nothing stack-specific; where a needed section is absent it falls back to a stated default and says so in its output.
 
@@ -21,20 +21,27 @@ This skill reads per-repo configuration from `docs/agents/skills-config.md` (wri
 
 The review fans out one agent per **lens**. The universal lenses always run; each **flow** the change touches (`docs/agents/skills-config.md` › Flows — one doc per flow) runs as one `flow-lens` agent. Below, "universal lens" rows are fixed; the flow-lens row applies per touched flow doc.
 
-**Default (full):** All phases and agents use **Opus** with extended thinking.
+**Economy (the default)** — tiered, mirroring the `ROLE` table in `.claude/workflows/review-fix-loop.js`, which is the executable source of truth for the same lens set. The tier names are what a repo overrides in `docs/agents/skills-config.md` › **Models**: `decision` (default `opus`/`high`), `worker` (default `sonnet`/`medium`).
 
-**Economy mode** (when `cheaper`/`cheap`/`simple`/`eco`/`economy` is passed):
+| Phase / Agent | Tier | Reason |
+|---------------|------|--------|
+| Universal — Derived-Quantity | **decision** | Cross-domain writers-closure reasoning |
+| Universal — Adjacent Code Paths | **worker** | Structured grep + verify pattern |
+| Universal — Negative Space | **worker** | Structured complement checklists |
+| Universal — Contract × Code | **worker** | Mechanical contract↔code diffing |
+| Universal — Test Coverage & Premises | **worker** | Semi-structured gap analysis |
+| Flow lens (per touched flow doc) | **decision** | Deep, repo-specific multi-stage reasoning |
 
-| Phase / Agent | Model | Reason |
-|---------------|-------|--------|
-| Universal — Derived-Quantity | **Opus** (extended thinking) | Cross-domain writers-closure reasoning |
-| Universal — Adjacent Code Paths | **Sonnet** (extended thinking) | Structured grep + verify pattern |
-| Universal — Negative Space | **Sonnet** (extended thinking) | Structured complement checklists |
-| Universal — Contract × Code | **Sonnet** | Mechanical contract↔code diffing |
-| Universal — Test Coverage & Premises | **Sonnet** | Semi-structured gap analysis |
-| Flow lens (per touched flow doc) | **Opus** (extended thinking) | Deep, repo-specific multi-stage reasoning |
+**Full** (`full` token, a plan-contract on the branch, or a Sensitive domain touched) puts every lens on the **decision** tier. Consolidation (Phase 3), facet enumeration (Phase 3.5) and adversarial verification (Phase 3.75) are always **decision** regardless of mode. Thinking is never disabled — effort is lowered instead. **Never set `CLAUDE_CODE_SUBAGENT_MODEL`**: it is first in the model-resolution order and overrides every choice here.
 
-Consolidation (Phase 3), facet enumeration (Phase 3.5) and adversarial verification (Phase 3.75) always use **Opus** regardless of mode.
+### Running on the API key (PR mode)
+
+A PR review is a good candidate for billing an API key instead of a plan's usage allowance: run it in a process that exports `ANTHROPIC_API_KEY` **for that process only**, and set the spend cap in the API console. Keep the key out of the repo (a secret manager / OS keychain); do not put it in `.claude/settings.json`.
+
+```bash
+ANTHROPIC_API_KEY="$(<read from your secret manager>)" \
+  claude -p "/deep-review <N> post" --allowedTools "Agent,Read,Grep,Glob,Bash(gh pr:*),Bash(gh api:*),Bash(git:*)"
+```
 
 When the change touches a **Sensitive domain** (`docs/agents/skills-config.md` › Sensitive domains), take the **heavy path**: run the full lens fan-out + facet enumeration + adversarial verification. When no configured Sensitive domain is touched (or none are listed), the change is on the **light path** — run the universal lenses and consolidate, but you may skip enumeration/verification when there are zero Blocker/High, and the review never blocks.
 
@@ -46,7 +53,7 @@ Parse arguments to determine the **review target** and **model tier**.
 
 ### Step 0a: Detect model tier
 
-If any argument matches `cheaper`, `cheap`, `simple`, `simpler`, `eco`, or `economy` → set **Economy mode**. Remove that token from the arguments. Otherwise → **Full mode**.
+If any argument matches `full` → set **Full**; if it matches `economy` (aliases `cheap`, `cheaper`, `simple`, `eco`) → set **Economy**. Remove that token from the arguments. Otherwise the tier is **Economy**, upgraded to **Full** when the branch carries a plan-contract (the planning glob from config › Docs layout) or the change touches a Sensitive domain. A `post` token (PR mode) is also removed here — see Phase 4.
 
 ### Step 0b: Detect review target
 
@@ -122,13 +129,13 @@ Read the repo config first: **`docs/agents/skills-config.md`** — it supplies t
 
 2. **Domain documentation**: Read the **core tenets** doc for business invariants (path from config › Docs layout › Core tenets; default `docs/CORE_TENETS.md`). Detect which domains the diff touches via config › Domains (path-glob → domain), and read the relevant **schema** docs for those domains (config › Docs layout › Schema, if present).
 
-3. **Premises files**: For each affected domain, read its premises file (path from config › Docs layout › Premises, substituting `{domain}`/`{module}` per the configured pattern; default `docs/{domain}/premises.md`) if it exists. These document technical invariants tests must protect. Pass premises contents to all agents.
+3. **Premises**: For each affected domain, read its **premises index** (path from config › Docs layout › Premises index; default `docs/{domain}/premises-index.md`) — one line per invariant tests must protect, each with an id. Pass the **index** to the agents, plus the **fetch command** (config › Docs layout › Premise fetch command; default `python3 .github/scripts/premise.py <id>`); each lens opens the bodies its lens needs, by id. Never pass a whole premises file: the `Read` tool truncates at 2000 lines and a domain's premises can exceed that. If the repo has no premises index, read the premises file itself, say so, and pass its contents.
 
-4. **Code conventions**: Read the repo's conventions doc(s) — its root `CLAUDE.md`/`AGENTS.md` and any rules dir (config › Docs layout › Rules dir).
+4. **Code conventions**: the repo's rules dir (config › Docs layout › Rules dir), if it has one.
 
 5. **Affected domains**: From the diff, list which domain areas are touched (per config › Domains). Note which, if any, are **Sensitive** (config › Sensitive domains) — that decides heavy vs light path.
 
-**Pass to all agents**: Full diff text, core-tenets doc, relevant schema docs, premises files, conventions doc, list of affected domains. In PR mode, also pass the title and description. Tell agents the docs-layout patterns so they can resolve further paths themselves.
+**Pass to all agents**: Full diff text, core-tenets doc, relevant schema docs, the premises **indices** (not the bodies — each lens opens what it needs by id with the fetch command), the docs-layout patterns so they can resolve further paths themselves, and the list of affected domains. In PR mode, also pass the title and description. Do **not** pass the root `CLAUDE.md`/`AGENTS.md`: every non-fork subagent loads that hierarchy by itself, so pasting it doubles several thousand tokens per lens for nothing.
 
 ---
 
@@ -150,11 +157,11 @@ These five are the lens model the whole pipeline depends on: the universal failu
 
 **Flow lenses (one per flow doc the change touches):**
 
-Read the **Flows dir** (`docs/agents/skills-config.md` › Flows; default `docs/flows/`). For each flow doc whose frontmatter `covers:` globs intersect the changed files — or every flow doc, if a doc has no `covers` or the change is broad — spawn one agent that reads `.claude/skills/deep-review/agents/flow-lens.md` and is given that flow's doc (path + content) as its spec. If there is no flows dir or no matching flow doc, spawn none — the universal set runs alone. (A money repo's `docs/flows/` might hold `payment-pipeline.md`, `dsa-lifecycle.md`, `payout.md`; a game engine's might hold `level-load.md`, `collision-resolution.md`. The flow doc, not this skill, carries the domain knowledge.)
+Read the **Flows dir** (`docs/agents/skills-config.md` › Flows; default `docs/flows/`). For each flow doc whose frontmatter `covers:` globs intersect the changed files — or every flow doc, if a doc has no `covers` or the change is broad — spawn one agent that reads `.claude/skills/deep-review/agents/flow-lens.md` and is given that flow's doc (path + content) as its spec. If there is no flows dir or no matching flow doc, spawn none — the universal set runs alone. (A payments repo's `docs/flows/` might hold `payment-pipeline.md`, `refund-lifecycle.md`, `disbursement.md`; a game engine's might hold `level-load.md`, `collision-resolution.md`. The flow doc, not this skill, carries the domain knowledge.)
 
 The Contract × Code lens short-circuits to `_No findings._` when the branch carries no plan-contract — it costs almost nothing on un-planned changes.
 
-For each agent: launch with `subagent_type: general-purpose`. In Economy mode set `model: opus` or `model: sonnet` per the routing table (flow lenses default to Opus); in Full mode all use Opus. The prompt template is:
+For each agent: launch with `subagent_type: general-purpose`, setting `model` from the tier in the routing table above (Full mode puts every lens on the decision tier). `effort` applies where the runtime accepts it (the `review-fix-loop` Workflow); a manual `Agent` fan-out sets `model` only. The prompt template is:
 
 > Read `.claude/skills/deep-review/agents/<role-file>.md` and operate as that
 > specialist. [For a flow lens, also: You are the `<flow>` lens; your flow doc
@@ -164,9 +171,9 @@ For each agent: launch with `subagent_type: general-purpose`. In Economy mode se
 > Bash) — use them liberally; scope `rg` to the repo.
 >
 > **Phase 1 context**:
-> {full diff, core-tenets doc, relevant schema docs, relevant premises files,
->  conventions doc, docs-layout patterns, list of affected domains, title/body
->  if applicable}
+> {full diff, core-tenets doc, relevant schema docs, relevant premises INDICES
+>  (open a body with the configured fetch command, by id), docs-layout patterns,
+>  list of affected domains, title/body if applicable}
 >
 > Output: a markdown findings document with the severity bucket structure
 > defined in your role file. Do NOT post to GitHub or any external system —
@@ -204,14 +211,14 @@ A mis-priced finding misdirects the whole fix round. A blind adversarial pass ov
    - `UNVERIFIABLE` → keep the severity, append the "what's missing" note.
 4. Verification does not re-trigger enumeration. A surface whose seed was refuted keeps its enumeration findings only where those were independently confirmed.
 
-Skip this phase only when there are zero Blocker/High findings. Economy mode does NOT skip it — mis-priced Blockers cost the most exactly when the review was cheap.
+Skip this phase only when there are zero Blocker/High findings. Economy does NOT skip it — mis-priced Blockers cost the most exactly when the review was cheap.
 
 For the terminal output, prepend this header to the body produced by the consolidator (merged with the enumeration findings, post-verification):
 
 ```markdown
 ## Code Review: {title or branch name}
 
-**Mode**: {Full Opus | Economy (tiered)}
+**Mode**: {Economy (tiered) | Full}
 **Path**: {Heavy (sensitive domain touched) | Light}
 **Target**: {PR #N | branch name | commit SHA | local changes}
 **Scope**: {files changed}, +{additions} / -{deletions}
@@ -248,7 +255,7 @@ If the user picks option 3, write the file and confirm the path.
 
 ## Key Rules
 
-- **Sensitive-domain impact is king**: in a domain the repo marks **Sensitive** (config › Sensitive domains), bugs that lose or corrupt money/state, double-count, or miscalculate are ALWAYS Blockers regardless of likelihood. If no Sensitive domains are configured, classify on data-corruption / broken-flow impact and never auto-block.
+- **Sensitive-domain impact is king**: in a domain the repo marks **Sensitive** (config › Sensitive domains), bugs that lose or corrupt value or state, double-count, or miscalculate are ALWAYS Blockers regardless of likelihood. If no Sensitive domains are configured, classify on data-corruption / broken-flow impact and never auto-block.
 - **Adjacent code is where the hardest bugs hide**: code NOT in the diff but broken by the changes is the highest-value finding category.
 - **The diff is the source of truth**: when verifying findings, the diff takes precedence over local file reads. If they disagree, you may be on the wrong branch.
 - **Verify before reporting**: if an agent claims "X doesn't handle Y", grep for it. False positives erode trust.

@@ -24,10 +24,13 @@ handshake. The doc is the truth; you turn it into review.
 
 - **The flow doc** — its narrative, entities & lifecycle, invariants, load-bearing quantities,
   and failure modes. This is your spec for what must hold.
-- **Phase 1 context** — the diff, change metadata, the core-tenets doc, relevant schema/premises
-  (paths from **Docs layout** in `docs/agents/skills-config.md`; default `docs/CORE_TENETS.md`
-  and `docs/{domain}/premises.md`, say so if you fall back), the conventions doc, the changed-file
-  list.
+- **Phase 1 context** — the diff, change metadata, the core-tenets doc, relevant schema docs and
+  the affected domains' **premises indices** (paths from **Docs layout** in
+  `docs/agents/skills-config.md`; defaults `docs/CORE_TENETS.md` and
+  `docs/{domain}/premises-index.md`, say so if you fall back), the changed-file list. Open a
+  premise body with the configured **premise fetch command** (default
+  `python3 .github/scripts/premise.py <id>`), by id — never the whole premises file, which the
+  `Read` tool truncates at 2000 lines.
 
 Use file tools (Read/Grep/Bash) liberally; scope `rg` to the repo. The diff is authoritative for
 what is proposed — but verify how it integrates with code NOT in the diff. If everything is
@@ -46,7 +49,7 @@ embedded with no file tools, work from that and flag predicted sites as "verify"
 3. **Check each invariant the doc states is preserved.** State it, then find the code that could
    violate it. For each **load-bearing quantity** the doc lists, confirm the change keeps its
    base/unit and cap consistent; **quantify impact with a concrete example** (specific amounts;
-   cents when money).
+   the smallest unit when it is a quantity).
 4. **Rank by the doc's failure modes.** If the flow is marked `sensitive` (or touches a config ›
    Sensitive domain), a correctness defect is a Blocker regardless of likelihood.
 5. **If the diff doesn't actually touch this flow, say so and stop** — return `_No findings._`.

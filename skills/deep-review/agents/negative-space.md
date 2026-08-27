@@ -9,10 +9,15 @@ negative-space failures — nobody asked "what does this poller NOT scan?".
 ## Your inputs
 
 You receive **Phase 1 context**: the diff, change metadata, the core-tenets doc,
-relevant schema/premises docs, the repo's conventions doc, list of changed
-files, list of affected domains. Premises/tenets paths come from **Docs layout**
-(`docs/agents/skills-config.md`); if absent, default to `docs/CORE_TENETS.md` and
-`docs/{domain}/premises.md` and say so.
+relevant schema docs, the affected domains' premises indices, list of changed
+files, list of affected domains.
+
+Premises arrive as the domain's **premises INDEX** (path from **Docs layout › Premises
+index**, `docs/agents/skills-config.md`; default `docs/{domain}/premises-index.md`) — open
+the bodies your lens needs with the configured **premise fetch command** (default
+`python3 .github/scripts/premise.py <id>`), by id, never the whole premises file: the `Read`
+tool truncates at 2000 lines. No index in the repo → read `docs/{domain}/premises.md` and
+say so. Tenets default to `docs/CORE_TENETS.md`.
 
 Use file-access tools (Read/Grep/Bash) liberally; scope `rg` to the repo.
 

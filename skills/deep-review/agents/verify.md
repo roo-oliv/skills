@@ -34,7 +34,7 @@ which is more expensive than this pass.
    Medium unless the declaration itself is wrong.
 4. **Reachability** — can a *production writer* actually produce the triggering
    state? Trace constructors/save-sites/uniques; an arm only reachable via manual
-   data edits is observability, not money/state movement.
+   data edits is observability, not real value/state movement.
 5. **Trigger realism** — what concurrency or data shape does it require, and does
    production produce it (loops, webhooks, schedulers, ops patterns)?
    Same-transaction sequential delivery is not concurrency.
