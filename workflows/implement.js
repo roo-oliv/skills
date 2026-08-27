@@ -27,6 +27,33 @@ const ROLE_DIR = `${ARGS.repoRoot}/.claude/skills/implement/agents`
 const CONFIG = 'docs/agents/skills-config.md'
 
 // ---------------------------------------------------------------------------
+// Role x model x effort. A DECIDER (writes what ships, or judges it) runs on the strong model at
+// high effort; a WORKER (assembles a body from a ledger, splits a plan into waves) on the cheap
+// model. Thinking is never disabled — effort is lowered instead. The tier names are the same five
+// buckets every workflow here uses, and a repo overrides them verbatim in ${CONFIG} › Models (the
+// skill reads that section and passes it as ARGS.models). NEVER set CLAUDE_CODE_SUBAGENT_MODEL:
+// it is first in the model-resolution order and collapses every tier into one model.
+// ---------------------------------------------------------------------------
+const TIER_DEFAULTS = {
+  decision: { model: 'opus', effort: 'high' },
+  worker: { model: 'sonnet', effort: 'medium' },
+  'pr-author': { model: 'sonnet', effort: 'medium' },
+}
+const TIERS = { ...TIER_DEFAULTS }
+for (const [k, v] of Object.entries(ARGS.models || {})) {
+  if (!TIER_DEFAULTS[k] || !v) continue
+  TIERS[k] = { model: v.model || TIER_DEFAULTS[k].model, effort: v.effort || TIER_DEFAULTS[k].effort }
+}
+const t = (name, effort) => ({ ...TIERS[name], ...(effort ? { effort } : {}) })
+const ROLE = {
+  setup: t('worker'), // plan → waves
+  wave: t('decision'), // wave-N (+retry) · recon-fix
+  verify: t('decision', 'medium'), // verify-N
+  verifyPlan: t('decision'), // verify-plan (+recheck) — reconciles what another agent wrote
+  prAuthor: t('pr-author'), // pr-author (ledger → PR body, rebase, push)
+}
+
+// ---------------------------------------------------------------------------
 // Schemas
 // ---------------------------------------------------------------------------
 
@@ -242,7 +269,8 @@ async function tryAgent(prompt, opts) {
 // ---------------------------------------------------------------------------
 
 phase('Setup')
-const setup = await tryAgent(setupPrompt(), { schema: SETUP_RESULT, label: 'setup' })
+log(`roles=${JSON.stringify(ROLE)}`)
+const setup = await tryAgent(setupPrompt(), { schema: SETUP_RESULT, label: 'setup', ...ROLE.setup })
 if (!setup) return { status: 'blocked', stage: 'setup', reason: 'setup agent died without a result' }
 if (!setup.branchOk) return { status: 'blocked', stage: 'setup', reason: setup.blockedReason || 'invalid branch/preflight' }
 
@@ -263,11 +291,11 @@ const closeFailure = (r) => {
   return null
 }
 for (const wave of waves) {
-  let res = await tryAgent(wavePrompt(wave), { schema: WAVE_RESULT, label: `wave-${wave.id}: ${wave.title}`, phase: 'Implement' })
+  let res = await tryAgent(wavePrompt(wave), { schema: WAVE_RESULT, label: `wave-${wave.id}: ${wave.title}`, phase: 'Implement', ...ROLE.wave })
   let failure = closeFailure(res)
   if (failure) {
     log(`wave ${wave.id} did not close (${failure.slice(0, 160)}) — single retry with a fresh agent`)
-    res = await tryAgent(wavePrompt(wave, failure), { schema: WAVE_RESULT, label: `wave-${wave.id}-retry`, phase: 'Implement' })
+    res = await tryAgent(wavePrompt(wave, failure), { schema: WAVE_RESULT, label: `wave-${wave.id}-retry`, phase: 'Implement', ...ROLE.wave })
     failure = closeFailure(res)
   }
   if (failure) {
@@ -287,7 +315,7 @@ phase('Verify')
 let green = false
 let failingSummary = ''
 for (let attempt = 1; attempt <= 3 && !green; attempt++) {
-  const v = await tryAgent(verifyPrompt(attempt, failingSummary), { schema: VERIFY_RESULT, label: `verify-${attempt}`, phase: 'Verify' })
+  const v = await tryAgent(verifyPrompt(attempt, failingSummary), { schema: VERIFY_RESULT, label: `verify-${attempt}`, phase: 'Verify', ...ROLE.verify })
   green = !!v?.green
   failingSummary = v?.failingSummary || ''
   if (!green) log(`verify attempt ${attempt}: still red — ${failingSummary.slice(0, 200)}`)
@@ -296,19 +324,19 @@ if (!green) {
   return { status: 'verify-failed', stage: 'verify', failingSummary, wavesDone: waveReports, decisions: allDecisions, note: 'branch pushed with a red build — do NOT open a PR' }
 }
 
-let recon = await tryAgent(reconPrompt(false), { schema: RECON_RESULT, label: 'verify-plan', phase: 'Verify' })
+let recon = await tryAgent(reconPrompt(false), { schema: RECON_RESULT, label: 'verify-plan', phase: 'Verify', ...ROLE.verifyPlan })
 let reconFixed = false
 if (recon && ((recon.missing || []).length || (recon.diverged || []).length || (recon.untestedPremises || []).length)) {
   log(`verify-plan: ${(recon.missing || []).length} missing, ${(recon.diverged || []).length} diverged, ${(recon.untestedPremises || []).length} premise(s) without a test — 1 fix round`)
-  const fix = await tryAgent(reconFixPrompt(recon), { schema: WAVE_RESULT, label: 'recon-fix', phase: 'Verify' })
+  const fix = await tryAgent(reconFixPrompt(recon), { schema: WAVE_RESULT, label: 'recon-fix', phase: 'Verify', ...ROLE.wave })
   if (fix?.decisions) allDecisions.push(...fix.decisions)
   reconFixed = true
-  recon = await tryAgent(reconPrompt(true), { schema: RECON_RESULT, label: 'verify-plan-recheck', phase: 'Verify' })
+  recon = await tryAgent(reconPrompt(true), { schema: RECON_RESULT, label: 'verify-plan-recheck', phase: 'Verify', ...ROLE.verifyPlan })
 }
 const residual = recon || { missing: [], diverged: [], unplanned: [] }
 
 phase('PR')
-const pr = await tryAgent(prPrompt(setup, allDecisions, residual, reconFixed, allTestEvidence), { schema: PR_RESULT, label: 'pr-author', phase: 'PR' })
+const pr = await tryAgent(prPrompt(setup, allDecisions, residual, reconFixed, allTestEvidence), { schema: PR_RESULT, label: 'pr-author', phase: 'PR', ...ROLE.prAuthor })
 if (!pr) {
   // The PR author works (rebase, push, gh pr create) BEFORE reporting — a crash at the report
   // step does not mean the PR was not opened. 'pr-unconfirmed' tells the orchestrator to check
@@ -327,6 +355,7 @@ if (!pr) {
 return {
   status: pr.status || 'blocked',
   stage: 'pr',
+  roles: ROLE,
   prNumber: pr?.prNumber,
   prUrl: pr?.prUrl,
   rebased: pr?.rebased || false,

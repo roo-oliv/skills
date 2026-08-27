@@ -50,9 +50,12 @@ Call `Workflow` with `scriptPath: .claude/workflows/implement.js` and `args` (a 
   "timestamp": "<date +%Y-%m-%dT%H-%M>",
   "deepPlanContractPath": "<path or null>",
   "prTitleHint": "<type(scope): description, in the repo's commit language>",
-  "maxWaves": 8
+  "maxWaves": 8,
+  "models": { "decision": { "model": "opus", "effort": "high" } }
 }
 ```
+
+`models` is the `## Models` section of the config, if the repo has one (`decision`, `worker`, `pr-author` → `model` + `effort`); omit it and the workflow uses its own defaults. Before launching, check `[ -z "${CLAUDE_CODE_SUBAGENT_MODEL:-}" ]` — that variable is first in the model-resolution order and would collapse the whole `ROLE` table into a single model.
 
 Size `maxWaves` from the plan, not from the ceiling: **the plan's number of phases/waves + 1 of margin** (a 3-wave plan → `maxWaves: 4`). The ceiling of 8 is for large plans with no phase structure, not the default for every bugfix.
 
@@ -66,7 +69,7 @@ Read the result and report to the user **leading with the outcome**:
 - `status: "pr-unconfirmed"` → the PR agent died **at the report step**, not necessarily at the work (rebase/push/`gh pr create` run before it). Check `gh pr view --head <branch>`: if the PR exists, proceed as `pr-opened`; if not, the ledger says where it stopped — re-launch the workflow (Setup detects the resume from the ledger and skips completed waves). **Never re-run from scratch without checking** — that false negative is exactly what this status exists to prevent.
 - `status: "blocked" | "verify-failed" | "blocked-gate"` → what was committed/pushed so far, the blocked wave/step and the reason. Do **not** chain the review. If it's `blocked-gate` (a deep-plan gate hook blocked `gh pr create`), the path is to complete the plan-contract — never instruct the override token.
 
-If `status: "pr-opened"` (or `pr-unconfirmed` with the PR confirmed via `gh`) and **not** `NO_REVIEW` → **invoke the `review-fix-loop` skill** (Skill tool) with the PR number, choosing the **cadence profile** per its Step 1: `profile=direct` by default; `thorough` for a multi-surface PR (>~25 production files), a plan with no refuted contract on the branch, or an explicit request for exhaustiveness. Propagate any cadence directive the user gave in this session. When it finishes, consolidate both stages into a single final message.
+If `status: "pr-opened"` (or `pr-unconfirmed` with the PR confirmed via `gh`) and **not** `NO_REVIEW` → **invoke the `review-fix-loop` skill** (Skill tool) with the PR number. Its structure is fixed and its mode is deterministic; there is nothing to tune from here. When it finishes, consolidate both stages into a single final message.
 
 ---
 
@@ -77,4 +80,5 @@ If `status: "pr-opened"` (or `pr-unconfirmed` with the PR confirmed via `gh`) an
 - **Verify**: the repo's full **Verify** command with a fix loop (≤3 attempts), then a `verify-plan` reconciliation (Missing/Diverged/Unplanned/UntestedPremises vs. Contract — the 4th bucket is the mechanical grep for `Tests: none yet` in the branch's premises) with 1 fix round; residuals become an explicit PR section, never silence.
 - **PR**: rebase onto `origin/<baseBranch>` (re-verifies if the rebase brought changes), push, and `gh pr create` with an extensive body in the repo's PR language following its Conventions — summary, test plan, autonomous-decisions section, and conditional sections (payloads, rollback, tables) when applicable.
 - **Decisions instead of questions**: workflow agents have no `AskUserQuestion`. At any decision point, the agent records the options, chooses the one that best serves the plan, and proceeds — the record appears in the ledger, the workflow output, and the PR description.
+- **Role × model × effort**: every `agent()` call declares `model` and `effort` from the `ROLE` table at the top of `implement.js` — `setup` on the worker tier, `wave`/`recon-fix` and `verify-plan` on the decision tier, `verify` on decision at medium effort, `pr-author` on the pr-author tier. Thinking is never disabled; effort is lowered instead. A repo overrides the tiers in config › **Models**, and the result echoes `roles`.
 - **Report-crash resilience**: every direct `await agent(...)` is wrapped in try/catch — a subagent that finishes without a `StructuredOutput` (throttling/retry cap) degrades to `null` and falls into the call site's fallback semantics (retry, blocked, `pr-unconfirmed`) instead of taking down the whole workflow with waves already committed and pushed. The ledger is the source of truth for resuming; a "failed" run with a complete ledger is a lost report, not lost work.

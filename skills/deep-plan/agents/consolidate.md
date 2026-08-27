@@ -17,8 +17,8 @@ is gone. You write the one thing JS cannot: the **narrative synthesis**.
   engine counts your themes and contradictions back out of the narrative — so
   writing them well is what makes the top-line honest.
 - The **four artifacts** — `## Contract` (numbered), `## Interaction matrix`
-  (every cell), `## Money dimension table` (the dimension table — money is the
-  canonical name; rows may be any load-bearing derived quantity), `## Precondition
+  (every cell), `## Dimension table` (the dimension table — a currency
+  amount is the canonical kind; rows may be any load-bearing derived quantity), `## Precondition
   diff`, and `## Failing-first tests & premises`.
 
 Do not write a title, a `## Contract` block, a matrix, or any of those tables. They

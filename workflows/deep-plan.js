@@ -2,10 +2,11 @@ export const meta = {
   name: 'deep-plan',
   description: 'Fill and adversarially refute a plan-contract (matrix, dimension table, precondition diff) from design intent + the live codebase, gating on completeness before synthesis.',
   whenToUse: 'Heavy pass of the /deep-plan skill: a sensitive-domain change that adds/modifies a status/lifecycle or replaces a flow. Invoked by .claude/skills/deep-plan/SKILL.md.',
+  calibratedFor: 'Frontier models as of 2026-08 — re-audit on each model upgrade (see the skill\'s Key rules).',
   phases: [
     { title: 'Enumerate', detail: 'grep caller-enumerated matrix columns + state-mutation seams + guard copies' },
     { title: 'Analyze', detail: 'dimension table, matrix cells, premise/test obligations' },
-    { title: 'Refute', detail: 'anchoring-free refuters loop-until-dry; resolver reopens cells/rows' },
+    { title: 'Refute', detail: 'one round of anchoring-free lensed refuters; the resolver reopens cells/rows' },
     { title: 'Gate', detail: 'programmatic completeness: no empty/unjustified cell, every load-bearing premise executable, every guard copy diffed' },
     { title: 'Synthesize', detail: 'deterministic verdict header + lossless artifacts (rendered in JS); LLM writes only the narrative synthesis' },
   ],
@@ -316,13 +317,12 @@ const ARGS = (typeof args === 'string' && args.trim())
 
 const intent = ARGS.intent || ''
 const domains = ARGS.domains || []
-const economy = !!ARGS.economy
 const noThrow = !!ARGS.noThrow
 const seedDraft = ARGS.seedDraft
 // The repo root the skill is running in. Every agent search MUST stay inside it
 // (and inside .gitignore) — never /tmp, never sibling worktrees. See ctx().
 const repoRoot = ARGS.repoRoot || '(the current repo root / cwd)'
-// 4 lensed refuters / 3 rounds. History: a 4x5 run reached the full r1+r2 cluster
+// 4 lensed refuters, ONE round. History: a 4x5 run reached the full r1+r2 cluster
 // union in one run — but at ~1.8x cost, STILL no convergence (flat 16/12/15/15/15),
 // and a gate of 374->0. The post-mortem found the real bug was label drift, not
 // breadth: every extra refuter wrote cells under its own (state,column) label variant
@@ -333,7 +333,7 @@ const repoRoot = ARGS.repoRoot || '(the current repo root / cwd)'
 // keying (below) — once labels collapse by code the gate is honest at ANY breadth. With
 // that landed AND canonicalizeMatrixStates collapsing the state-axis drift, the amplifier
 // is fixed twice over and a coherent matrix is confirmed — so breadth is now re-raised
-// DELIBERATELY, as that post-mortem invited. DRY_ROUNDS_TO_STOP=2 early-exits converged plans.
+// DELIBERATELY, as that post-mortem invited, while DEPTH drops to one round (below).
 //
 // Breadth = 4 (was 2). The FLAT 11/11/8 trajectory showed coverage-per-round — the number
 // of distinct attack angles launched — was the binding constraint, NOT round depth (which
@@ -345,20 +345,17 @@ const repoRoot = ARGS.repoRoot || '(the current repo root / cwd)'
 // ARGS.refutersPerRound overrides per-run for a big change.
 const REFUTERS_PER_ROUND = Math.max(1, ARGS.refutersPerRound || 4)
 const REFUTER_LENSES = [
-  'QUANTITY / dimensional: attack the derived values — a value combined at the wrong base (e.g. face vs residual vs principal-only vs with-interest for money, or a window-bounded sum vs an instantaneous snapshot for a count), an uncapped settle/mint/derivation, a balance or Σ=0 invariant checked against a SELF-REFERENTIAL sum, a double-count across legs.',
+  'QUANTITY / dimensional: attack the derived values — a value combined at the wrong base (e.g. face vs residual vs principal-only vs with-interest for a currency amount, or a window-bounded sum vs an instantaneous snapshot for a count), an uncapped settle/mint/derivation, a balance or Σ=0 invariant checked against a SELF-REFERENTIAL sum, a double-count across legs.',
   'ASYNC / ordering / lifecycle: attack timing — a post-commit write lost to a same-transaction join, a crash window between ack and commit, a non-idempotent re-fire / double-action, a two-clock lag, a predicate that must read live status-as-of-event but reads it once.',
   'PREMISE / invariant: attack the stated invariants — a path that violates an immutability / sum / identity premise or a CORE TENET, a load-bearing invariant with no require/check at its seam, a premise the new code introduces but never protects.',
   'COMPLETENESS / wrong-cell: attack the matrix itself — a cell marked handled/N·A that is actually a GAP, a column or state the matrix never enumerated, a copied guard whose precondition is now false for the new caller set.',
 ]
-const MAX_REFUTE_ROUNDS = 3
-const DRY_ROUNDS_TO_STOP = 2
-// Targeted refuters for the resolution re-refute pass (after the loop ends at the round
-// cap, the FINAL round's resolver patch ships unattacked — every earlier patch was
-// re-attacked by the next round). Half breadth: the target set is a handful of named
-// resolutions, not the whole draft. The blind spot was priced post-code: resolutions
-// minted late in refute became a Blocker + Highs that a downstream review found at ~one
-// facet per round.
-const RESOLUTION_REREFUTERS = Math.max(1, ARGS.reRefuters || 2)
+// ONE refute round by default: every recorded trajectory is FLAT — rounds 2–3 mint as many
+// fresh refutations as round 1 (fix-attack equilibrium, not discovery). Coverage comes from
+// BREADTH (the lensed refuters above) and from an independent re-run (SKILL.md › One run does
+// not exhaust), never from depth. `ARGS.refuteRounds` opts into depth for a single run; with
+// one round there is no unattacked-final-patch problem, so the resolution re-refute pass is gone.
+const REFUTE_ROUNDS = Math.max(1, ARGS.refuteRounds || 1)
 // Gate-justify passes. A refuter that adds a column/state grows the cartesian, leaving
 // new (state×column) pairs empty; ONE justify pass left them empty on a real run,
 // the gate stayed FAIL, and the run threw away ~3M tokens. Each pass is fed the
@@ -366,13 +363,45 @@ const RESOLUTION_REREFUTERS = Math.max(1, ARGS.reRefuters || 2)
 // and a residual after the loop is recorded (NOT thrown) — deep-plan never blocks.
 const GATE_JUSTIFY_ROUNDS = 2
 
-// Economy-mode model routing (mirrors the SKILL.md table). Full mode omits the
-// model so each agent inherits the session model.
-function mdl(role) {
-  if (!economy) return undefined
-  const eco = { a1: 'opus', a2: 'sonnet', a3: 'opus', a4: 'sonnet', a5: 'sonnet', a6: 'opus', resolver: 'opus', consolidate: 'opus' }
-  return eco[role]
+// ---------------------------------------------------------------------------
+// Role x model x effort. A DECIDER (judges a load-bearing quantity or writes what ships:
+// dimension table, state-mutation seams, refuters, resolver, consolidator) runs on the strong
+// model at high effort; a WORKER (collects evidence under a checklist: matrix columns, matrix
+// cells, premise/test obligations) on the cheap model at medium. Thinking is never disabled —
+// effort is lowered instead. Agents of the same phase share model/effort/schema, so they share
+// a cache prefix.
+//
+// The tier names below are the same five buckets every workflow in this repo uses, and a repo
+// overrides them verbatim in `docs/agents/skills-config.md` › Models (the skill reads that
+// section and passes it as ARGS.models). NEVER set CLAUDE_CODE_SUBAGENT_MODEL: it is first in
+// the model-resolution order and collapses every tier into one model.
+// ---------------------------------------------------------------------------
+const TIER_DEFAULTS = {
+  decision: { model: 'opus', effort: 'high' },
+  worker: { model: 'sonnet', effort: 'medium' },
 }
+const TIERS = { ...TIER_DEFAULTS }
+for (const [k, v] of Object.entries(ARGS.models || {})) {
+  if (!TIER_DEFAULTS[k] || !v) continue
+  TIERS[k] = { model: v.model || TIER_DEFAULTS[k].model, effort: v.effort || TIER_DEFAULTS[k].effort }
+}
+// `economy` is the default (the reasoning-heavy agents are already on the decision tier);
+// `full` — by arg, or by the sensitive-domain / plan-contract trigger the skill passes —
+// upgrades the worker agents too.
+const TIER = (ARGS.full || ARGS.tier === 'full') ? 'full' : 'economy'
+const t = (name, effort) => ({ ...TIERS[name], ...(effort ? { effort } : {}) })
+const ROLE = {
+  a1: t('decision'), // analyze:dimension-table
+  a2: t('worker'), // enumerate:matrix-columns
+  a3: t('decision'), // enumerate:state-mutation-seams
+  a4: t('worker'), // analyze:matrix-cells
+  a5: t('worker'), // analyze:premises-tests
+  a6: t('decision'), // refute:*
+  resolver: t('decision'), // analyze:fill · refute:resolve-* · gate:justify-*
+  consolidate: t('decision', 'medium'), // synthesize:consolidate — narrow rubric, not a search
+}
+const FULL_UPGRADES = new Set(['a2', 'a4', 'a5'])
+const role = (k) => (TIER === 'full' && FULL_UPGRADES.has(k) ? t('decision') : ROLE[k])
 
 // Shared Phase-1 preamble. Agents have file tools and must read the docs
 // themselves — the intent is the analogue of deep-review's diff. Doc paths are
@@ -447,8 +476,8 @@ function normCode(s) {
 // normCode collapses only EXACT-string variants once a leading code is present; an
 // uncoded state falls back to its full lowercased label, so two conventions for the SAME
 // logical state stay distinct. This strips the parenthetical gloss and ALL whitespace and
-// lowercases, turning "StoreStopLoss.status = STOPLOSS (active, routes…)" and the terse
-// "status=STOPLOSS" into "storestoploss.status=stoploss" and "status=stoploss" — where the
+// lowercases, turning "Shipment.status = HELD (active, routes…)" and the terse
+// "status=HELD" into "shipment.status=held" and "status=held" — where the
 // terse form is a dotted-suffix of the verbose one.
 // The gloss strip must handle NESTED parens: a single-pass `\([^)]*\)` stops at the first
 // `)`, so "SRE RETENTION_HOLD credit (…heldToKeep=max(0,capΣ−sreBalance))" left a trailing
@@ -465,8 +494,8 @@ function looseStateForm(s) {
 // True when two state labels denote the SAME logical state: equal loose forms, or one is
 // the other with a leading qualifier dropped ("Entity.field=value" vs "field=value").
 // The suffix match is boundary-anchored on '.' so the bare "status=x" matches the
-// qualified "storestoploss.status=x", while two DISTINCT qualified states
-// ("cohortpayout.status=x" vs "transfer.status=x") never match each other (neither is a
+// qualified "shipment.status=x", while two DISTINCT qualified states
+// ("order.status=x" vs "transfer.status=x") never match each other (neither is a
 // suffix of the other). Applied to the state axis ONLY — columns are seam-anchored
 // (file:line) and do not exhibit this verbose/terse drift (verified: zero loose collapses
 // among the 32 columns of one real run).
@@ -606,7 +635,7 @@ function mergeCell(a, b) {
 // Collapse verbose/terse variants of the same logical state to ONE canonical label, remap
 // every cell's state, and merge cells that then collide on (state, column). WHY: a
 // downstream fill/refute/justify agent paraphrases an enumerated state into a terser
-// convention ("status=STOPLOSS" vs the verbose "StoreStopLoss.status = STOPLOSS (…)");
+// convention ("status=HELD" vs the verbose "Shipment.status = HELD (…)");
 // normCode's full-label fallback can't collapse them, so the cell-reconcile loop minted a
 // phantom duplicate state, the cartesian DOUBLED (a run: 18 states / 576 cells where
 // 9 / 288 were real), and the gate-justify pass then dutifully FILLED all ~288 phantom
@@ -628,7 +657,7 @@ function canonicalizeMatrixStates(d) {
   for (const s of bySpecificity) {
     // Membership = mutual compatibility with EVERY member of EXACTLY ONE group.
     // sameLogicalState is deliberately non-transitive — a terse "status=PAID" matches
-    // BOTH "CohortPayout.status=PAID" and "Transfer.status=PAID", which never match each
+    // BOTH "Order.status=PAID" and "Transfer.status=PAID", which never match each
     // other — so the old `some`-membership computed the transitive closure: the terse
     // state BRIDGED two distinct qualified states into one group, silently erasing a
     // matrix row. `every` blocks the bridge; the ≥2-full-matches guard keeps a genuinely
@@ -905,7 +934,7 @@ function renderArtifacts(draft) {
     out.push(`| ${mdCell(c.state)} | ${mdCell(c.column)} | ${c.verdict} | ${mdCell(note)} |`)
   }
   out.push('')
-  out.push('## Money dimension table', '')
+  out.push('## Dimension table', '')
   out.push('| Variable | Unit / base | Cap | require/check seam |', '|---|---|---|---|')
   for (const r of (draft.dimension.rows || [])) out.push(`| ${mdCell(r.variable)} | ${mdCell(r.unitBase)} | ${mdCell(r.cap)} | ${mdCell(r.seam)} |`)
   if (!(draft.dimension.rows || []).length) out.push('| _(none)_ | | | |')
@@ -991,17 +1020,10 @@ function renderVerdict(draft, m) {
   const mixNote = mix && mix.resolution + mix.newSurface > 0
     ? ` Final-round mix: ${mix.resolution} attack earlier rounds' RESOLUTIONS vs ${mix.newSurface} new surface — a high resolution share means the loop is in fix-attack equilibrium (each fix mints new attack surface), not still discovering the original surface.`
     : ''
-  // Resolution re-refute outcome: the targeted pass over the final round's otherwise-
-  // unattacked resolutions. "held" is a real signal (they survived adversarial scrutiny);
-  // a fresh>0 outcome means the re-refute's OWN resolutions now ship unattacked — say so.
-  const rr = m.reRefute
-  const reRefuteNote = rr
-    ? ` Resolution re-refute (targeted pass over the final round's ${rr.targets} otherwise-unattacked resolution(s)): ${rr.fresh === 0 ? 'all held — 0 fresh.' : `${rr.fresh} fresh refutation(s), integrated by a single resolver pass — that patch ships unattacked; weigh its resolutions accordingly.`}`
-    : ''
-  const trajectory = fbr.length ? ` Fresh refutations per round: [${fbr.join(', ')}] — shape **${shape}**${shapeNote}.${mixNote}${reRefuteNote}` : ''
+  const trajectory = fbr.length ? ` Fresh refutations per round: [${fbr.join(', ')}] — shape **${shape}**${shapeNote}.${mixNote}` : ''
   const refute = m.converged
-    ? `converged after ${m.rounds} round(s).${trajectory}`
-    : `**did NOT converge** — hit the ${m.maxRounds}-round cap with ${m.lastFresh} fresh refutation(s) still landing in the final round.${trajectory} Treat this contract as a SAMPLE of the interaction space, not an exhaustive enumeration.`
+    ? `${m.rounds} breadth round(s), the last one with no fresh refutation.${trajectory}`
+    : `${m.rounds} breadth round(s) with ${m.lastFresh} fresh refutation(s) still landing in the last one.${trajectory} Treat this contract as a SAMPLE of the interaction space, not an exhaustive enumeration — for coverage, run again (SKILL.md › One run does not exhaust).`
   // (B) GAP clustering: the headline cell count over-states remaining unknowns — most cells
   // are ONE un-built surface repeated across rows. Reduce to distinct seams (+ the Síntese
   // theme count) so the planner reads ~decisions, not ~cells.
@@ -1141,8 +1163,8 @@ if (seedVerdict) {
 // =====================================================================
 phase('Enumerate')
 const [cols, seams] = await parallel([
-  () => agent(ctx('matrix-columns.md'), { label: 'enumerate:matrix-columns', phase: 'Enumerate', schema: MATRIX_COLUMNS, model: mdl('a2'), agentType: 'general-purpose' }),
-  () => agent(ctx('state-mutation-seams.md'), { label: 'enumerate:state-mutation-seams', phase: 'Enumerate', schema: SETTLEMENT_SEAMS, model: mdl('a3'), agentType: 'general-purpose' }),
+  () => agent(ctx('matrix-columns.md'), { label: 'enumerate:matrix-columns', phase: 'Enumerate', schema: MATRIX_COLUMNS, ...role('a2'), agentType: 'general-purpose' }),
+  () => agent(ctx('state-mutation-seams.md'), { label: 'enumerate:state-mutation-seams', phase: 'Enumerate', schema: SETTLEMENT_SEAMS, ...role('a3'), agentType: 'general-purpose' }),
 ])
 if (!cols || !seams) throw new Error('Enumerate phase failed — matrix columns or state-mutation seams missing.')
 // Matrix discipline: keep only columns citing a concrete seam (file:line / source
@@ -1160,12 +1182,12 @@ phase('Analyze')
 const columnList = (cols.columns || []).map(c => c.name).join(', ')
 const stateList = (cols.states || []).join(', ')
 const [dim, cellsOut, premOut] = await parallel([
-  () => agent(ctx('dimension-table.md'), { label: 'analyze:dimension-table', phase: 'Analyze', schema: DIMENSION_TABLE, model: mdl('a1'), agentType: 'general-purpose' }),
+  () => agent(ctx('dimension-table.md'), { label: 'analyze:dimension-table', phase: 'Analyze', schema: DIMENSION_TABLE, ...role('a1'), agentType: 'general-purpose' }),
   () => agent(
     ctx('lifecycle-matrix.md') + `\n\n=== MATRIX TO FILL ===\nStates (rows): ${stateList}\nColumns: ${columnList}\nAnswer EVERY (state x column) cell handled/N·A/GAP. Column sites:\n` + (cols.columns || []).map(c => `- ${c.name} @ ${c.site} (reads ${c.reads})`).join('\n'),
-    { label: 'analyze:matrix-cells', phase: 'Analyze', schema: MATRIX_CELLS, model: mdl('a4'), agentType: 'general-purpose' },
+    { label: 'analyze:matrix-cells', phase: 'Analyze', schema: MATRIX_CELLS, ...role('a4'), agentType: 'general-purpose' },
   ),
-  () => agent(ctx('test-coverage.md'), { label: 'analyze:premises-tests', phase: 'Analyze', schema: PREMISE_OBLIGATIONS, model: mdl('a5'), agentType: 'general-purpose' }),
+  () => agent(ctx('test-coverage.md'), { label: 'analyze:premises-tests', phase: 'Analyze', schema: PREMISE_OBLIGATIONS, ...role('a5'), agentType: 'general-purpose' }),
 ])
 if (!dim || !cellsOut || !premOut) throw new Error('Analyze phase failed — a specialist slice is missing.')
 
@@ -1214,17 +1236,17 @@ const filled = await agent(
     null,
     true,
   ),
-  { label: 'analyze:fill', phase: 'Analyze', schema: DRAFT_PATCH, model: mdl('resolver'), agentType: 'general-purpose' },
+  { label: 'analyze:fill', phase: 'Analyze', schema: DRAFT_PATCH, ...role('resolver'), agentType: 'general-purpose' },
 )
 if (filled) draft = applyPatch(draft, filled)
 
 // =====================================================================
-// PHASE 3 — REFUTE: anchoring-free refuters, loop-until-dry. Each fresh
-// refutation reopens a cell/row; the resolver integrates it; re-refute.
+// PHASE 3 — REFUTE: anchoring-free lensed refuters, ONE round by default. Each
+// fresh refutation reopens a cell/row and the resolver integrates it.
 // =====================================================================
 phase('Refute')
+log(`tier=${TIER} roles=${JSON.stringify(ROLE)}`)
 const seen = new Set()
-let dry = 0
 let round = 0
 let lastRoundFresh = 0 // fresh refutations in the final executed round — feeds the convergence verdict
 const freshByRound = [] // fresh count per round — the trajectory shape (FLAT vs DECAYING) renderVerdict reports
@@ -1233,12 +1255,7 @@ const freshByRound = [] // fresh count per round — the trajectory shape (FLAT 
 // rounds — the loop is GENERATIVE (each resolver patch mints new attack surface), not
 // re-sampling an unexplored original surface. The mix is what tells the planner which.
 const freshMixByRound = []
-// The fresh items the FINAL resolver patch integrated. Non-empty after the loop only when
-// it ended at the round cap right after a resolve — i.e. that patch was never attacked.
-// A dry round clears it: dry means the refuters swept the draft (last patch included) and
-// found nothing, so the previous resolutions already survived scrutiny.
-let lastResolvedItems = []
-while (dry < DRY_ROUNDS_TO_STOP && round < MAX_REFUTE_ROUNDS) {
+while (round < REFUTE_ROUNDS) {
   round++
   const summary = draftSummary(draft)
   // Already-open roots: cells the draft already marks GAP + unresolved dimension
@@ -1272,7 +1289,7 @@ while (dry < DRY_ROUNDS_TO_STOP && round < MAX_REFUTE_ROUNDS) {
           `=== END DRAFT ===`,
           `Refute-or-promote on all four surfaces. Default to refuted when uncertain. Return the RefutationVerdict.`,
         ].join('\n'),
-        { label: `refute:r${round}-${i + 1}`, phase: 'Refute', schema: REFUTATION, model: mdl('a6'), agentType: 'general-purpose' },
+        { label: `refute:r${round}-${i + 1}`, phase: 'Refute', schema: REFUTATION, ...role('a6'), agentType: 'general-purpose' },
       )
     )
   )).filter(Boolean)
@@ -1294,81 +1311,17 @@ while (dry < DRY_ROUNDS_TO_STOP && round < MAX_REFUTE_ROUNDS) {
   const mixResolution = fresh.filter((r) => r.attacks === 'resolution').length
   freshMixByRound.push({ resolution: mixResolution, newSurface: fresh.length - mixResolution })
   if (!fresh.length) {
-    dry++
-    lastResolvedItems = []
-    log(`Refute round ${round}: dry (${dry}/${DRY_ROUNDS_TO_STOP}).`)
+    log(`Refute round ${round}: no fresh refutation.`)
     continue
   }
-  dry = 0
   log(`Refute round ${round}: ${fresh.length} fresh refutation(s) — reopening cells/rows.`)
   const resolved = await agent(
     resolverPrompt(draft, 'Integrate the refutations below: add any missing matrix column AND fill its cells, reopen wrongly-handled cells (set to GAP with justification, or fix to handled WITH evidence/where), fix dimension violations, and amend precondition rows whose precondition is shown false.', { title: 'REFUTATIONS TO RESOLVE', body: fresh.map(r => `- [${r.surface}] ${r.target}: ${r.scenario} (forces: ${r.forces})`).join('\n') }, true),
-    { label: `refute:resolve-r${round}`, phase: 'Refute', schema: DRAFT_PATCH, model: mdl('resolver'), agentType: 'general-purpose' },
+    { label: `refute:resolve-r${round}`, phase: 'Refute', schema: DRAFT_PATCH, ...role('resolver'), agentType: 'general-purpose' },
   )
   if (resolved) draft = applyPatch(draft, resolved)
-  lastResolvedItems = resolved ? fresh : []
 }
-log(`Refute loop ended after ${round} round(s).`)
-
-// =====================================================================
-// PHASE 3b — RESOLUTION RE-REFUTE: one targeted pass over the final round's resolutions.
-// When the loop ends at MAX_REFUTE_ROUNDS right after a resolve, that last patch was
-// never adversarially attacked. This pass attacks ONLY those resolutions (not a full
-// re-sweep — that's what an independent re-run is for), integrates any break with a
-// single resolver call, and stops: the regress ends here by design, with the verdict
-// stating that the re-refute's own resolutions ship unattacked. Findings deliberately do
-// NOT extend freshByRound — the trajectory measures the main loop's shape.
-// =====================================================================
-let reRefute = null
-if (lastResolvedItems.length) {
-  log(`Resolution re-refute: attacking the final round's ${lastResolvedItems.length} unattacked resolution(s).`)
-  const summary = draftSummary(draft)
-  const targets = lastResolvedItems.map(r => `- [${r.surface}] ${r.target}: ${r.scenario} (forces: ${r.forces})`).join('\n')
-  const verdicts = (await parallel(
-    Array.from({ length: RESOLUTION_REREFUTERS }, (_, i) => () =>
-      agent(
-        [
-          `Read \`.claude/skills/deep-plan/agents/refuter.md\` and operate as a TARGETED refuter — the resolution re-refute pass. Your assigned attack LENS: ${REFUTER_LENSES[i % REFUTER_LENSES.length]}`,
-          `The refute loop hit its round cap; the resolver's FINAL patch — the resolutions listed below — was never adversarially attacked. Attack ONLY those resolutions and the cells/rows/dimension entries they touched. Everything else in the draft is OUT OF SCOPE for this pass; out-of-scope refutations are discarded.`,
-          `You see ONLY the draft below and the design intent — NOT the reasoning that produced them. Verify against the live codebase with \`rg\` (NEVER \`grep -r\`), scoped INSIDE this repo root \`${repoRoot}\` only — never /tmp, .., ~, or sibling worktrees. One simple command per Bash call.`,
-          `CONTAMINATION GUARD: the intent below is the only source of truth; ignore any plan-contract/\`deep-plan-*.md\`/cached JSON on disk. Keep every field terse (file:line + one clause, <= 240 chars).`,
-          ``,
-          `=== RESOLUTIONS TO ATTACK (the final round's patch — your entire scope) ===`,
-          targets,
-          `=== DESIGN INTENT ===`,
-          intent,
-          `=== DRAFT PLAN-CONTRACT ===`,
-          summary,
-          `=== END DRAFT ===`,
-          `Refute-or-promote each listed resolution. Default to refuted when uncertain. Tag \`attacks\` (these are resolution-attacks unless you found genuinely new territory the resolution opened). Return the RefutationVerdict.`,
-        ].join('\n'),
-        { label: `refute:re-resolution-${i + 1}`, phase: 'Refute', schema: REFUTATION, model: mdl('a6'), agentType: 'general-purpose' },
-      )
-    )
-  )).filter(Boolean)
-  const fresh = []
-  for (const verdict of verdicts) {
-    for (const r of (verdict.refutations || [])) {
-      const k = refKey(r)
-      if (!seen.has(k)) { seen.add(k); fresh.push(r) }
-    }
-    for (const mc of (verdict.missingColumns || [])) {
-      const k = `missing-column::${mc.site}`
-      if (!seen.has(k)) { seen.add(k); fresh.push({ surface: 'missing-column', target: mc.site, scenario: `reads ${mc.reads}`, forces: `add column for ${mc.site}`, attacks: 'new-surface' }) }
-    }
-  }
-  reRefute = { targets: lastResolvedItems.length, fresh: fresh.length }
-  if (fresh.length) {
-    log(`Resolution re-refute: ${fresh.length} fresh refutation(s) against the final patch — integrating (single pass, no further loop).`)
-    const resolved = await agent(
-      resolverPrompt(draft, 'Integrate the refutations below — each attacks a resolution the FINAL refute round just minted: reopen the wrongly-fixed cells (set to GAP with justification, or fix to handled WITH evidence/where), add any missing matrix column AND fill its cells, fix dimension violations, and amend precondition rows whose precondition is shown false.', { title: 'REFUTATIONS TO RESOLVE', body: fresh.map(r => `- [${r.surface}] ${r.target}: ${r.scenario} (forces: ${r.forces})`).join('\n') }, true),
-      { label: 'refute:re-resolution-resolve', phase: 'Refute', schema: DRAFT_PATCH, model: mdl('resolver'), agentType: 'general-purpose' },
-    )
-    if (resolved) draft = applyPatch(draft, resolved)
-  } else {
-    log(`Resolution re-refute: all ${lastResolvedItems.length} resolution(s) held (0 fresh).`)
-  }
-}
+log(`Refute ended after ${round} round(s).`)
 
 // =====================================================================
 // PHASE 4 — GATE: programmatic completeness. A bounded justify loop, each pass fed the
@@ -1385,7 +1338,7 @@ while (!pass && gateRound < GATE_JUSTIFY_ROUNDS) {
   log(`Gate: ${violations.length} violation(s)${empties.length ? `, ${empties.length} empty grid cell(s)` : ''} — justify pass ${gateRound}/${GATE_JUSTIFY_ROUNDS}.`)
   const justified = await agent(
     resolverPrompt(draft, 'The gate found the violations below. Resolve each: fill EVERY empty cell listed (a matrix grown by a refuter leaves new state×column pairs blank — fill ALL of them, not only ones a refuter named), give every GAP a written justification, make every load-bearing premise executable (seam + failing-first test), resolve dimension violations, and complete every per-copy precondition row. A GAP you cannot close must carry an explicit written justification.', { title: 'GATE VIOLATIONS', body: violations.map(x => `- ${x.kind}: ${x.detail}`).join('\n') + (empties.length ? `\n\nEMPTY CELLS TO FILL (every one):\n` + empties.map(m => `- [${m.state}] x [${m.column}]`).join('\n') : '') }, true),
-    { label: `gate:justify-${gateRound}`, phase: 'Gate', schema: DRAFT_PATCH, model: mdl('resolver'), agentType: 'general-purpose' },
+    { label: `gate:justify-${gateRound}`, phase: 'Gate', schema: DRAFT_PATCH, ...role('resolver'), agentType: 'general-purpose' },
   )
   if (justified) draft = applyPatch(draft, justified)
   ;({ pass, violations } = gateCheck(draft, seams.copiedGuards))
@@ -1412,7 +1365,7 @@ if (!pass) {
 // checks now verify the engine's own render (a regression guard), not the LLM's retype.
 // =====================================================================
 phase('Synthesize')
-const converged = dry >= DRY_ROUNDS_TO_STOP
+const converged = lastRoundFresh === 0
 const artifacts = renderArtifacts(draft)
 // (C) consistency watch: seams carrying a committed directive (contract item) AND >=1 other
 // reference are where two parts of the contract can give conflicting directives (the fork
@@ -1434,7 +1387,7 @@ const narrative = stripPreamble(await agent(
     ``,
     `Affected domains: ${domains.join(', ')}.`,
   ].join('\n'),
-  { label: 'synthesize:consolidate', phase: 'Synthesize', model: mdl('consolidate'), agentType: 'general-purpose' },
+  { label: 'synthesize:consolidate', phase: 'Synthesize', ...role('consolidate'), agentType: 'general-purpose' },
 ))
 // Count themes / contradictions back OUT of the narrative so renderVerdict's top-line leads
 // with what the consolidator actually flagged (deterministic — reports the LLM's own output).
@@ -1450,10 +1403,8 @@ const verdictHeader = renderVerdict(draft, {
   lastFresh: lastRoundFresh,
   freshByRound,
   freshMixByRound,
-  reRefute,
   narrativeThemes,
   contradictions,
-  maxRounds: MAX_REFUTE_ROUNDS,
 })
 let body = [verdictHeader, narrative || '## Síntese\n\n_(no narrative produced)_', artifacts].join('\n\n')
 
@@ -1477,7 +1428,6 @@ return {
   rounds: round,
   freshByRound,
   freshMixByRound,
-  reRefute,
   converged,
   contradictions,
   consolidationOmissions: omissions,
