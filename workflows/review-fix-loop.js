@@ -1,13 +1,14 @@
 export const meta = {
   name: 'review-fix-loop',
-  description: 'Review→conciliate→fix loop over an open PR until exhaustion (0 High/Blocker in a breadth round + dry enumeration), with a round cap + a final Medium/Low round; posts each consolidated review on the PR',
+  description: 'FIXED structure over an open PR: breadth (lenses) → single judge → consolidated review posted on the PR → fix → fix-review (model ≠ fixer), with at most one second fix + fix-review when the fix-review finds Blocker/High. No round machine: the repo\'s CI review on each push and the human code owner are the next gates.',
   whenToUse: 'Invoked by the /review-fix-loop skill (.claude/skills/review-fix-loop/SKILL.md) with an open PR and its branch checked out.',
+  calibratedFor: 'Frontier models as of 2026-08 — re-audit on each model upgrade (see the skill\'s Contract).',
   phases: [
-    { title: 'Classify', detail: 'standard (mirror of Anthropic\'s code-review action) vs deep (deep-review lenses)' },
-    { title: 'Review', detail: 'round 1/gate: breadth fan-out (universal + per-flow lenses); rounds 2+: bounded validator of fixes + fix-diff reviewer' },
-    { title: 'Enumerate', detail: 'exhausts each hot surface (facets with evidence) in the same round' },
-    { title: 'Conciliate', detail: 'fuses with comments/reviews already posted, dedups, posts on the PR' },
-    { title: 'Fix', detail: 'addresses Blocker/High + aged Mediums, commit+push, updates the description, replies to divergences' },
+    { title: 'Scope', detail: 'deterministic deep/standard mode + an agent judging whether the diff solves ONE scoped problem' },
+    { title: 'Review', detail: 'breadth (universal + flow lenses in deep, standard-review + 2 structural lenses in standard) + single judge: confidence >= 8, exclusions, refutation of B/H' },
+    { title: 'Conciliate', detail: 'fuses with what is already on the PR, dedups, posts the consolidated review (once)' },
+    { title: 'Fix', detail: 'addresses the posted Blocker/High/Medium, commit+push, updates the description, replies to divergences' },
+    { title: 'Fix-review', detail: 'one reviewer, model != fixer, over the fix diff only; posts on the PR' },
   ],
 }
 
@@ -23,46 +24,75 @@ if (missingArgs.length) {
 }
 
 const PR = ARGS.prNumber
-// Cadence profile: 'thorough' (the historical default — redundancy calibrated for models whose
-// individual passes are less reliable) vs 'direct' (strong passes: fewer rounds/surfaces and a
-// SCOPED exhaustion gate — see gateAgents). Explicit overrides (maxRounds etc.) beat the profile.
-const PROFILE = ARGS.profile === 'direct' ? 'direct' : 'thorough'
-const PROFILE_DEFAULTS = PROFILE === 'direct'
-  ? { maxRounds: 3, maxExtensions: 1, maxEnumSurfaces: 4 }
-  : { maxRounds: 5, maxExtensions: 2, maxEnumSurfaces: 6 }
-const MAX_ROUNDS = Math.min(Math.max(ARGS.maxRounds || PROFILE_DEFAULTS.maxRounds, 1), 10)
-const MAX_EXTENSIONS = Math.min(Math.max(ARGS.maxExtensions ?? PROFILE_DEFAULTS.maxExtensions, 0), 5)
-const MAX_ENUM_SURFACES = Math.min(Math.max(ARGS.maxEnumSurfaces ?? PROFILE_DEFAULTS.maxEnumSurfaces, 1), 12)
 const ROLE_DIR = `${ARGS.repoRoot}/.claude/skills/review-fix-loop/agents`
 const DEEP_DIR = `${ARGS.repoRoot}/.claude/skills/deep-review/agents`
 const CONFIG = 'docs/agents/skills-config.md'
-// Terminal-push verify: under 'direct' the full build stays with the PR's CI (the authoritative
-// gate, which the orchestrator watches via gh pr checks) — the terminal fixer runs the targeted
-// verify. Under 'thorough' the terminal push leaves with the full local Verify (historical behavior).
-const TERMINAL_VERIFY = PROFILE === 'direct'
-  ? `run the TARGETED verify (format/lint + the tests covering the branch diff + the always-run gates from ${CONFIG} › Verify) before the final push — the FULL Verify command stays with the PR's CI, which is the authoritative gate and is watched by the orchestrator`
-  : `run the FULL Verify command (${CONFIG} › Verify › Full) before the final push`
 
-// Deep mode fans out the genericized deep-review lens set installed alongside this skill:
-// the UNIVERSAL lenses (always, by flat role-file name) + one FLOW lens per flow doc the
-// change touches, via deep-review's generic flow-lens.md mechanism. The repo declares its
-// flows as docs (config › Flows; the orchestrator passes the touched ones); a repo with no
-// financial (or any) flows simply passes none. If a role file is missing on the branch, the
-// lens prompt short-circuits to {"findings": []}.
+// ---------------------------------------------------------------------------
+// Role x model x effort. A DECIDER (judges code / a critical quantity, or writes what ships)
+// runs on the strong model at high effort; a WORKER (collects evidence under a checklist) on the
+// cheap model at medium/low. The fixer runs on a model DIFFERENT from the reviewer of its fix
+// (reviewer != author: one model catches more bugs in another model's code than in its own).
+// Thinking is never disabled — effort is lowered instead.
+//
+// The five buckets below are what a repo may override, verbatim, in ${CONFIG} › Models
+// (decision / worker / fixer / fix-review / pr-author → model + effort). The orchestrator reads
+// that section and passes it as ARGS.models; anything absent keeps the default here. Defaults name
+// generic tiers (`opus`, `sonnet`) — a repo whose account has other models renames them in config.
+// NEVER set CLAUDE_CODE_SUBAGENT_MODEL: it is first in the model-resolution order and collapses
+// every tier below into one model, killing reviewer != fixer. The skill's preflight aborts on it.
+// ---------------------------------------------------------------------------
+
+const TIER_DEFAULTS = {
+  decision: { model: 'opus', effort: 'high' },
+  worker: { model: 'sonnet', effort: 'medium' },
+  fixer: { model: 'opus', effort: 'high' },
+  'fix-review': { model: 'sonnet', effort: 'high' },
+  'pr-author': { model: 'sonnet', effort: 'medium' },
+}
+const TIERS = { ...TIER_DEFAULTS }
+for (const [k, v] of Object.entries(ARGS.models || {})) {
+  if (!TIER_DEFAULTS[k] || !v) continue
+  TIERS[k] = { model: v.model || TIER_DEFAULTS[k].model, effort: v.effort || TIER_DEFAULTS[k].effort }
+}
+// `full` upgrades the worker lenses to the decision tier. Deterministic trigger: a deep-plan
+// contract on the branch (or an explicit `tier` arg) — same trigger the deep-review heavy path uses.
+const TIER = ARGS.tier === 'full' || ARGS.tier === 'economy' ? ARGS.tier : (ARGS.deepPlanContractOnBranch ? 'full' : 'economy')
+const t = (name, effort) => ({ ...TIERS[name], ...(effort ? { effort } : {}) })
+const ROLE = {
+  scope: t('worker', 'low'),
+  lensDeep: t('decision'), // derived-quantity + one lens per touched flow: cross-domain reasoning
+  lensWorker: TIER === 'full' ? t('decision') : t('worker'), // adjacent · negative-space · contract · tests
+  standard: t('decision'),
+  judge: t('decision', 'medium'), // consolidator = judge: narrow rubric, not a search
+  conciliate: t('worker'), // verifying B/H is the judge's job, not this one's
+  fixer: t('fixer'),
+  fixReview: t('fix-review'), // reviewer of the fix — model different from the fixer
+}
+
+// Deep mode fans out the genericized deep-review lens set installed alongside this skill: the
+// UNIVERSAL lenses (always) + one FLOW lens per flow doc the change touches, via deep-review's
+// generic flow-lens.md mechanism. The repo declares its flows as docs (config › Flows; the
+// orchestrator passes the touched ones); a repo with no flows simply passes none. If a role file
+// is missing on the branch, the lens prompt short-circuits to {"findings": []}.
 const UNIVERSAL_LENSES = [
-  { key: 'adjacent', file: 'adjacent-code.md' },
-  { key: 'quantity', file: 'derived-quantity.md' },
-  { key: 'negspace', file: 'negative-space.md' },
-  { key: 'contract', file: 'contract-reconciler.md' },
-  { key: 'tests', file: 'test-coverage.md' },
+  { key: 'adjacent', file: 'adjacent-code.md', role: 'lensWorker' },
+  { key: 'quantity', file: 'derived-quantity.md', role: 'lensDeep' },
+  { key: 'negspace', file: 'negative-space.md', role: 'lensWorker' },
+  { key: 'contract', file: 'contract-reconciler.md', role: 'lensWorker' },
+  { key: 'tests', file: 'test-coverage.md', role: 'lensWorker' },
 ]
-// Flow lenses come from the orchestrator (the touched flow docs): [{ name, doc }] where `doc`
-// is the flow doc's full text. Each runs the generic flow-lens.md role file with that doc.
+// Flow lenses come from the orchestrator (the touched flow docs): [{ name, doc }] where `doc` is
+// the flow doc's full text. Each runs the generic flow-lens.md role file with that doc.
 const FLOW_LENSES = (Array.isArray(ARGS.flows) ? ARGS.flows : [])
   .filter((l) => l && (l.name || l.doc))
   .slice(0, 8)
-  .map((l, i) => ({ key: `flow-${i}`, file: 'flow-lens.md', name: String(l.name || `flow-${i}`).slice(0, 60), doc: String(l.doc || '').slice(0, 6000) }))
+  .map((l, i) => ({ key: `flow-${i}`, file: 'flow-lens.md', role: 'lensDeep', name: String(l.name || `flow-${i}`).slice(0, 60), doc: String(l.doc || '').slice(0, 6000) }))
 const DEEP_AGENTS = [...UNIVERSAL_LENSES, ...FLOW_LENSES]
+// Standard: the mirror of the CI review action + the two STRUCTURAL lenses (negative space and
+// contract x code) — the ones that depend on no domain knowledge and whose blind spots are the
+// most expensive to leave uncovered.
+const STANDARD_LENSES = ['negspace', 'contract']
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -72,24 +102,28 @@ const SEVERITIES = ['Blocker', 'High', 'Medium', 'Low']
 
 const FINDING = {
   type: 'object',
-  required: ['id', 'severity', 'title', 'description'],
+  required: ['id', 'severity', 'title', 'description', 'confidence'],
   properties: {
-    id: { type: 'string', maxLength: 60, description: 'stable slug derived from file+topic, e.g. payout-sweep-cap' },
+    id: { type: 'string', maxLength: 60, description: 'stable slug derived from file+topic, e.g. sweep-cap-missing' },
     severity: { type: 'string', enum: SEVERITIES },
     title: { type: 'string', maxLength: 120 },
     file: { type: 'string', maxLength: 160 },
     line: { type: 'string', maxLength: 20 },
-    surface: { type: 'string', maxLength: 80, description: 'file+mechanism slug (e.g. SettlementService.paidSoFar-query) — groups Blocker/High for facet enumeration; same root = same key' },
     description: { type: 'string', maxLength: 500, description: 'concrete scenario where something observable goes wrong' },
     suggestedFix: { type: 'string', maxLength: 300 },
-    source: { type: 'string', maxLength: 80, description: 'this round\'s reviewer | @human | <bot> | earlier round | validator | fix-diff | enumerate:<surface>' },
+    confidence: { type: 'integer', minimum: 1, maximum: 10, description: '10 = reproduced by a test/trace with file:line; 8 = mechanism traced in the code with file:line and no contrary guard found; 6 = plausible, not traced; 5 or less = speculation' },
+    premise: { type: 'string', maxLength: 160, description: 'optional: EXACT title of the documented premise this finding violates' },
+    source: { type: 'string', maxLength: 80, description: 'lens | judge | fix-review | @human | <bot>' },
   },
 }
 
 const FINDINGS = {
   type: 'object',
   required: ['findings'],
-  properties: { findings: { type: 'array', items: FINDING, maxItems: 25 } },
+  properties: {
+    findings: { type: 'array', items: FINDING, maxItems: 25 },
+    refuted: { type: 'array', maxItems: 20, description: 'the judge only: Blocker/High it discarded, with the evidence that kills them', items: { type: 'object', required: ['id', 'evidence'], properties: { id: { type: 'string', maxLength: 60 }, evidence: { type: 'string', maxLength: 240 } } } },
+  },
 }
 
 const CONSOLIDATED = {
@@ -99,39 +133,17 @@ const CONSOLIDATED = {
     findings: { type: 'array', items: FINDING, maxItems: 60 },
     commentUrl: { type: 'string', maxLength: 200 },
     droppedAsContested: { type: 'array', items: { type: 'string', maxLength: 60 }, maxItems: 20 },
-    droppedForSpace: { type: 'array', items: { type: 'string', maxLength: 60 }, maxItems: 30, description: 'ids of Low omitted from the comment for space — NEVER Blocker/High/Medium' },
   },
 }
 
-const ENUM_RESULT = {
+const SCOPE_RESULT = {
   type: 'object',
-  required: ['surface', 'dry'],
+  required: ['scoped', 'problem', 'reason'],
   properties: {
-    surface: { type: 'string', maxLength: 80 },
-    dry: { type: 'boolean', description: 'true iff findings is empty' },
-    facets: {
-      type: 'array',
-      maxItems: 25,
-      items: {
-        type: 'object',
-        required: ['facet', 'verdict'],
-        properties: {
-          facet: { type: 'string', maxLength: 120 },
-          verdict: { type: 'string', enum: ['ok', 'finding', 'unchecked'] },
-          evidence: { type: 'string', maxLength: 200, description: 'file:line for ok; reason for unchecked' },
-        },
-      },
-    },
-    findings: { type: 'array', items: FINDING, maxItems: 15 },
-  },
-}
-
-const CLASSIFY_RESULT = {
-  type: 'object',
-  required: ['mode', 'reason'],
-  properties: {
-    mode: { type: 'string', enum: ['standard', 'deep'] },
+    scoped: { type: 'boolean' },
+    problem: { type: 'string', maxLength: 200 },
     reason: { type: 'string', maxLength: 300 },
+    suggestedSlices: { type: 'array', maxItems: 6, items: { type: 'object', required: ['title'], properties: { title: { type: 'string', maxLength: 120 }, files: { type: 'array', items: { type: 'string', maxLength: 160 }, maxItems: 20 } } } },
   },
 }
 
@@ -148,13 +160,47 @@ const FIX_RESULT = {
   },
 }
 
-const VALIDATION_RESULT = {
+const FIX_REVIEW = {
   type: 'object',
-  required: ['resolved', 'stillOpen'],
+  required: ['verdict'],
   properties: {
-    resolved: { type: 'array', maxItems: 20, items: { type: 'object', required: ['id'], properties: { id: { type: 'string', maxLength: 60 }, evidence: { type: 'string', maxLength: 240, description: 'file:line of post-fix code that resolves the scenario' } } } },
-    stillOpen: { type: 'array', maxItems: 20, items: { type: 'object', required: ['id', 'why'], properties: { id: { type: 'string', maxLength: 60 }, why: { type: 'string', maxLength: 300 } } } },
+    verdict: { type: 'string', enum: ['clean', 'open'], description: 'open iff regressions or unaddressed contains a Blocker/High' },
+    regressions: { type: 'array', items: FINDING, maxItems: 15, description: 'NEW defects introduced by the fixer\'s commits' },
+    unaddressed: { type: 'array', maxItems: 20, items: { type: 'object', required: ['id', 'severity', 'why'], properties: { id: { type: 'string', maxLength: 60 }, severity: { type: 'string', enum: SEVERITIES }, why: { type: 'string', maxLength: 300 } } } },
+    commentUrl: { type: 'string', maxLength: 200 },
   },
+}
+
+// ---------------------------------------------------------------------------
+// Posting predicate — deterministic, in code: no agent decides this. Confidence < 8 and the
+// classes listed under `## Review exclusions` in the repo's recurring-failure-modes doc (they
+// arrive as ARGS.exclusions, extracted by the skill's preflight) drop BEFORE the judge. An
+// invalid regex is logged and ignored, never takes the run down.
+// ---------------------------------------------------------------------------
+
+const MIN_CONFIDENCE = 8
+const exclusions = []
+for (const e of ARGS.exclusions || []) {
+  try {
+    exclusions.push({ id: e.id, re: new RegExp(e.pattern, 'i') })
+  } catch (err) {
+    log(`exclusion ${e && e.id ? e.id : '?'} is invalid — ignored (${String((err && err.message) || err).slice(0, 100)})`)
+  }
+}
+let droppedByConfidence = 0
+const droppedByExclusion = {}
+
+function applyHardFilters(findings, stage) {
+  const input = findings || []
+  const kept = []
+  for (const f of input) {
+    if (typeof f.confidence === 'number' && f.confidence < MIN_CONFIDENCE) { droppedByConfidence++; continue }
+    const hit = exclusions.find((e) => e.re.test(`${f.title || ''} ${f.description || ''}`))
+    if (hit) { droppedByExclusion[hit.id] = (droppedByExclusion[hit.id] || 0) + 1; continue }
+    kept.push(f)
+  }
+  if (kept.length !== input.length) log(`filter (${stage}): ${input.length} → ${kept.length} finding(s)`)
+  return kept
 }
 
 // ---------------------------------------------------------------------------
@@ -171,167 +217,127 @@ function ctx() {
   ].join('\n')
 }
 
-function classifyPrompt() {
-  const sd = ARGS.sensitiveDomains || []
-  return `${ctx()}
-
-You decide the review depth for this PR. Collect: gh pr view ${PR} --json title,body,additions,deletions,files; touched domains (git diff --name-only origin/main...HEAD, mapped to domains via ${CONFIG} › Domains).
-
-Choose "deep" if ANY of:
-- There is a deep-plan contract committed on this branch (the plan-contract glob from ${CONFIG} › Docs layout, e.g. .claude/deep-plan/*.md, in the diff)${ARGS.deepPlanContractOnBranch ? ' — ALREADY CONFIRMED by the orchestrator: there is a contract on the branch' : ''};
-- The diff touches one of the repo's Sensitive domains (${CONFIG} › Sensitive domains) AND changes a status/lifecycle, a state machine, a settlement/payout-equivalent flow, a load-bearing computation, or a migration with a backfill. If no sensitive domains are configured, this arm never fires — default to standard unless a deep-plan contract is on the branch;
-- The change is large/delicate enough that a single reviewer would likely miss emergent interactions (rule of thumb: >~25 production files, or new concurrency/async ordering).
-
-Otherwise "standard". Orchestrator hints: sensitiveDomains=${JSON.stringify(sd)}, diffFiles=${ARGS.diffFiles ?? 'unknown'}.`
-}
-
 function contractNote() {
   const confirmed = ARGS.deepPlanContractOnBranch ? ' (the orchestrator CONFIRMED there is a contract on this branch)' : ''
-  return `Plan-contract as input${confirmed}: if the branch has a committed contract (the plan-contract glob from ${CONFIG} › Docs layout, e.g. .claude/deep-plan/*.md — check with git diff --name-only origin/main...HEAD), READ IT before analyzing the diff. Fixers of earlier rounds update the semantics they minted into it (dimension rows, premises, struck items) — the contract is the CURRENT spec, not the original plan's. A code↔contract divergence is a finding; a derived value present in the code with no corresponding dimension row/premise in the contract is also a finding (High).`
+  return `Plan-contract as input${confirmed}: if the branch carries a committed contract (the plan-contract glob from ${CONFIG} › Docs layout › Planning, e.g. \`.claude/deep-plan/*.md\` — check with git diff --name-only origin/main...HEAD), READ IT before analyzing the diff. The contract is the CURRENT spec, not the original plan's. A code↔contract divergence is a finding; a derived load-bearing value present in the code with no corresponding dimension row / premise in the contract is also a finding (High).`
 }
 
-function standardReviewPrompt(round) {
+function confidenceNote() {
+  return `Every finding carries "confidence" (1–10, rubric in the schema): 10 = reproduced; 8 = mechanism traced in the code with file:line and no contrary guard; 6 = plausible, not traced; 5 or less = speculation. Below 8 the finding is DISCARDED in code before the judge — do not inflate the number, just don't report what you did not trace. If the finding violates a documented premise, fill "premise" with that premise's exact title.`
+}
+
+function dispositionsNote() {
+  return `Disposition rule (also a review criterion): every case a diff handles carries one of four dispositions, visible in the diff — (1) inexpressible (the type/state model cannot represent it); (2) validated at the boundary (once, producing a typed error); (3) supported (with a test); (4) impossible (an assertion at the seam, no branch). A handled case with NO disposition — a defensive branch, a silent fallback, a broad catch with no disposition, an impossible case handled by a conditional instead of an assertion at the seam — is a finding (Medium; High when it masks a load-bearing value or state). Boundary complement: tolerate what an external provider may ADD (unknown fields), never what VIOLATES its spec (missing required field, wrong type, value out of range) — silent recovery entrenches the bug downstream.`
+}
+
+function scopePrompt() {
   return `${ctx()}
 
-Read ${ROLE_DIR}/standard-review.md and operate as that reviewer (round ${round}). You review the CURRENT head of the PR — earlier rounds may already have fixed things; report what is in the code now, not the history.
+You decide whether this diff solves ONE scoped problem. Collect: gh pr view ${PR} --json title,body,files,additions,deletions and git diff --stat origin/main...HEAD.
+
+"scoped": true when every group of files is explained by the problem the title/summary state and the parts depend on each other. "scoped": false when the diff is a collage of two or more independent things (feature + unrelated refactor + drive-by fix; a summary whose items do not presuppose each other). SIZE IS NOT A CRITERION — a large diff in service of one problem is scoped. If false, propose the slices (title + files): the recommendation goes into the review comment, it blocks nothing.`
+}
+
+function standardReviewPrompt() {
+  return `${ctx()}
+
+Read ${ROLE_DIR}/standard-review.md and operate as that reviewer over the CURRENT head of the PR.
+
+${confidenceNote()}
+
+${dispositionsNote()}
 
 ${contractNote()}`
 }
 
-function deepReviewPrompt(a, round, kind) {
+function deepReviewPrompt(a) {
   const isFlow = a.file === 'flow-lens.md'
   const roleLine = isFlow
-    ? `Read ${DEEP_DIR}/flow-lens.md and operate as the "${a.name}" flow lens. Review the diff against what this flow doc says must hold:\n\n=== FLOW DOC: ${a.name} ===\n${a.doc || '(no doc text passed; apply the flow name to this diff)'}\n=== END FLOW DOC ===\n(round ${round} of review-fix-loop${kind === 'gate' ? ' — exhaustion GATE: earlier rounds zeroed High/Blocker in targeted passes; you are the clean breadth look that confirms or refutes exhaustion' : ''})`
-    : `Read ${DEEP_DIR}/${a.file} and operate as that specialist (round ${round} of review-fix-loop${kind === 'gate' ? ' — exhaustion GATE: earlier rounds zeroed High/Blocker in targeted passes; you are the clean breadth look that confirms or refutes exhaustion' : ''})`
+    ? `Read ${DEEP_DIR}/flow-lens.md and operate as the "${a.name}" flow lens. Review the diff against what this flow doc says must hold:\n\n=== FLOW DOC: ${a.name} ===\n${a.doc || '(no doc text passed; apply the flow name to this diff)'}\n=== END FLOW DOC ===`
+    : `Read ${DEEP_DIR}/${a.file} and operate as that specialist`
   return `${ctx()}
 
 ${roleLine}. If the role file does not exist on this branch, return immediately {"findings": []}.
 
-Context you collect yourself (deep-review Phase 1): diff via gh pr diff ${PR}; metadata via gh pr view ${PR} --json title,body,files; the core-tenets doc (${CONFIG} › Docs layout › Core tenets; default docs/CORE_TENETS.md); the schema and premises docs of the affected domains (${CONFIG} › Docs layout, substituting {domain}/{module}; default docs/schema/{domain}.md and docs/{domain}/premises.md); the repo's conventions doc. Do NOT read the PR's existing comments/reviews — clean look. The diff is the source of truth for what is being proposed; read the full files for adjacent context. Verify before reporting (grep/read before claiming "X doesn't handle Y").
+Context you collect yourself (deep-review Phase 1): the diff via gh pr diff ${PR}; metadata via gh pr view ${PR} --json title,body,files; the core-tenets doc (${CONFIG} › Docs layout › Core tenets; default docs/CORE_TENETS.md); the schema doc of each affected domain (${CONFIG} › Docs layout › Schema); and the **premises INDEX** of each affected domain (${CONFIG} › Docs layout › Premises index; default docs/{domain}/premises-index.md) — open the body of a premise with the fetch command from ${CONFIG} › Docs layout › Premise fetch command (default \`python3 .github/scripts/premise.py <id>\`), NEVER the whole premises file: the Read tool truncates at 2000 lines and a domain's premises can exceed that. If the repo has no premises index, read the premises file itself and say so. Do NOT read the PR's existing comments/reviews — clean look. The diff is the source of truth for what is being proposed; read the full files for adjacent context. Verify before reporting (grep/read before claiming "X doesn't handle Y").
+
+${confidenceNote()}
+
+${dispositionsNote()}
 
 ${contractNote()}
 
-Convert your findings to the findings schema (severities Blocker/High/Medium/Low per your role file; a defect in a Sensitive domain per ${CONFIG} › Sensitive domains is always Blocker — if none configured, grade by ordinary functional impact). For each Blocker/High fill "surface" (file+mechanism slug).`
+Convert your findings to the findings schema (severities Blocker/High/Medium/Low per your role file; a defect in a Sensitive domain per ${CONFIG} › Sensitive domains is always Blocker — if none are configured, grade by ordinary functional impact).`
 }
 
-function consolidatePrompt(slices, round) {
+function judgePrompt(slices) {
   return `${ctx()}
 
-Read ${DEEP_DIR}/consolidate.md and apply the consolidation logic (dedup, verification of high-severity — demotion of Blocker/High only with evidence read in the code, classification) to the findings of the ${slices.length} specialists below (round ${round}). Do NOT post anything to GitHub — return only the consolidated list in the schema. For each Blocker/High fill "surface" (file+mechanism slug; same root = same key) — it is the key for the enumeration stage.
+Read ${DEEP_DIR}/consolidate.md and consolidate (dedup + classification) the findings of the ${slices.length} specialists below. Do NOT post anything to GitHub — return only the consolidated list in the schema.
+
+You are the JUDGE, and you are the ONLY one: there is no validator and no verifier after you. For each Blocker/High, read the code and apply the refutation hunt from ${DEEP_DIR}/verify.md, in this order — a guard the finding missed · a recovery arm for any permanence claim · a declaration · reachability by a production writer · trigger realism. Verdict per Blocker/High: CONFIRMED (fold the sharpest evidence into the finding) · REPRICED (change "severity" and say why) · REFUTED (discard it and list it in "refuted" with the file:line that kills it, so the next reviewer does not re-mine it). Demotion requires evidence, never doubt; never soften the text of a finding that survives.
+
+The findings arrive WITHOUT lens attribution — judge the finding, not who found it. Anything below confidence 8, and the classes listed under \`## Review exclusions\` in the repo's recurring-failure-modes doc (${CONFIG} › Docs layout › Planning), already dropped in code before reaching you.
 
 Specialist findings:
 ${JSON.stringify(slices, null, 2)}`
 }
 
-function enumeratePrompt(surface, seeds, round, opts) {
+function conciliatePrompt(findings, scope) {
   return `${ctx()}
 
-Read ${DEEP_DIR}/enumerate.md and operate as that facet enumerator (round ${round} of review-fix-loop). If the role file does not exist on this branch, return immediately {"surface": ${JSON.stringify(surface)}, "dry": true, "facets": [], "findings": []}.
+Read ${ROLE_DIR}/conciliate.md and operate as that agent. SINGLE pass: this is the only review this loop posts.
 
-Hot surface: ${surface}
+Findings already judged (the judge refuted and re-priced what it could — do NOT re-verify Blocker/High):
+${JSON.stringify(findings, null, 2)}
 
-Seed findings (Blocker/High confirmed on this surface):
-${JSON.stringify(seeds, null, 2)}
+${scope && scope.scoped === false ? `SCOPE: the scope agent judged that this PR does not solve a single problem — "${scope.problem}" (${scope.reason}). Add a "Scope" section with the recommendation to slice it and the suggested slices: ${JSON.stringify(scope.suggestedSlices || [])}. It is a recommendation to the author, not a block.` : ''}
 
-${opts.postFix
-    ? `The seed findings were just addressed by the fixer (commits: ${JSON.stringify(opts.commits || [])}). Do NOT re-report the seed defect: audit the CURRENT code of the surface — the sibling facets the fix did not cover and regressions the fix itself introduced on it.`
-    : `The seed findings are NOT yet fixed. Do NOT re-report them — look for the sibling facets of the same surface.`}
-
-${contractNote()}
-
-For each new finding fill "surface" with the same key above. "dry": true only with the whole facet table "ok" with evidence — never mark ok without file:line.`
+Lows are NOT listed — only counted, on the line "**Lows**: N (not listed)". Blocker, High and Medium all go in.`
 }
 
-function validationPrompt(claimedFixed, fixResult, postCap) {
+function fixerPrompt(findings, opts) {
   return `${ctx()}
 
-You are the review-fix-loop bounded VALIDATOR${postCap ? ' (post-cap: the loop hit the round cap right after this fix — there was no validation review)' : ''}. The previous round's fixer claimed to have fixed the findings below. Your scope is CLOSED: for EACH finding below, adversarially judge whether the fix present at the current head resolves the finding's concrete scenario — read the post-fix code (file:line), run a targeted test if there's an obvious one. Do NOT look for new problems, do NOT re-review the PR, do NOT edit anything.
+Read ${ROLE_DIR}/fixer.md and operate as that agent${opts.second ? ' — this is the SECOND and last fix: the previous fix-review found Blocker/High' : ''}.
 
-Findings fixed without validation (with the fixer's note in fixNote):
-${JSON.stringify(claimedFixed, null, 2)}
+Address the Blocker/High/Medium below: implement, run the TARGETED verify (the incremental Verify command from ${CONFIG} › Verify plus the always-run gates listed there — the FULL build stays with the PR's CI, which is the authoritative gate), commit, push, update the PR description, and reply on the PR whenever you decide to diverge from a finding, with the why.
 
-Fixer commits: ${JSON.stringify(fixResult?.commits || [])}
-
-Every finding below must appear in exactly one bucket: resolved (with file:line evidence) or stillOpen (with a concrete why).`
-}
-
-function fixDiffPrompt(commits, round) {
-  return `${ctx()}
-
-You are the FIX-DIFF reviewer (round ${round} of review-fix-loop). The previous round's fixer pushed the commits: ${JSON.stringify(commits)}.
-
-Review ONLY the code touched by those commits (git show <sha>, git diff <first>^..<last>) — you look for what the fixes themselves introduced: a regression, a predicate/temporal window/formula with new semantics, a derived value minted without a dimension row in the contract, a guard copied whose precondition doesn't hold for the new caller, a test weakened to pass. Do NOT re-review the whole PR — only the delta of the fixes. Verify before reporting.
-
-${contractNote()}
-
-Standard severities (a defect in a Sensitive domain per ${CONFIG} › Sensitive domains = Blocker; if none configured, grade by functional impact). For each Blocker/High fill "surface" (file+mechanism slug).`
-}
-
-function conciliatePrompt(freshFindings, state, round, mode, kind, mediumAges) {
-  return `${ctx()}
-
-Read ${ROLE_DIR}/conciliate.md and operate as that agent (round ${round}, mode ${mode}, round type: ${kind}).
-
-Fresh findings from this round (the source field distinguishes: specialists/consolidator, post-fix validator, fix-diff, enumerate:<surface>):
-${JSON.stringify(freshFindings, null, 2)}
-
-Loop state (earlier rounds):
-- fixed: ${JSON.stringify(state.fixed)}
-- diverged (contested by the fixer, argument posted on the PR): ${JSON.stringify(state.diverged)}
-- Medium ages (consecutive rounds the id appeared — ≥2 indicates a stale queue; re-price or mark the age): ${JSON.stringify(mediumAges)}`
-}
-
-function fixerPrompt(findings, round, opts) {
-  const aged = (opts.agedMediums || []).map((m) => m.id)
-  return `${ctx()}
-
-Read ${ROLE_DIR}/fixer.md and operate as that agent (round ${round}).
-
-${opts.finalRound
-    ? `FINAL ROUND: the review zeroed High/Blocker. Address the pending Medium/Low below. After you NO ONE reviews again — ${TERMINAL_VERIFY}.`
-    : `Address the Blocker/High below${aged.length ? ` and the AGED Mediums (≥2 rounds in the queue — assigned, not optional: fix or formal divergence): ${JSON.stringify(aged)}` : ''}. Opportunistic Mediums (same files): ${JSON.stringify(opts.mediumsInSameFiles || [])}${opts.mustFullVerify ? `\n\nLAST POSSIBLE ROUND (loop cap): after you no review validates and no fixer corrects — ${TERMINAL_VERIFY}, exactly like a final round.` : ''}`}
+After you, ONE fix-review runs (on a model different from yours) over your diff${opts.second ? ', and nothing else' : ''}. There is no depth round: whatever is not addressed here is left to the CI review and the human reviewer.
 
 Assigned findings:
 ${JSON.stringify(findings, null, 2)}`
 }
 
-function cappedCommentPrompt(buckets, roundsSummary, gatePending) {
+function fixReviewPrompt(posted, commits, opts) {
   return `${ctx()}
 
-The review-fix-loop hit the round cap. Post a comment on the PR (gh pr comment ${PR} --body-file <tmpfile>) in the commit/PR language from ${CONFIG} › Conventions, marker <!-- review-fix-loop: capped -->, with the buckets below in SEPARATE sections — the distinction between them is what makes the comment true (the last review and the last fix are different instants; don't mix them):
+You are the FIX-REVIEW${opts.second ? ' (second and last pass)' : ''} — the only reviewer of the fix, on a model different from the fixer's. CLOSED scope, two questions:
 
-1. "Open" — High/Blocker with no fix, or whose fix the validator judged insufficient (validatorNote field):
-${JSON.stringify(buckets.open, null, 2)}
+1. REGRESSION — review ONLY the code touched by the fixer's commits (${JSON.stringify(commits)}): git show <sha>, git diff <first>^..<last>. Look for what the fixes themselves introduced: a predicate / temporal window / formula with new semantics, a derived load-bearing value with no dimension row in the contract, a guard copied whose precondition does not hold for the new caller, a test weakened to pass. Do NOT re-review the whole PR.
+2. UNADDRESSED — for each posted finding below: does the current head resolve its concrete scenario? If not, and the fixer posted no divergence with an argument, list it under "unaddressed" with the why.
 
-2. "Fixed in the last round — bounded validation OK, no full review" (evidence field):
-${JSON.stringify(buckets.fixedValidated, null, 2)}
+${confidenceNote()}
 
-3. "Fixed in the last round — WITHOUT validation" (fixer's claim only):
-${JSON.stringify(buckets.fixedUnreviewed, null, 2)}
+${contractNote()}
 
-4. "Contested by the fixer, no re-assessment" (argument already posted on the PR):
-${JSON.stringify(buckets.contested, null, 2)}
+Post a comment on the PR (gh pr comment ${PR} --body-file <tmpfile>) in the commit/PR language from ${CONFIG} › Conventions, with the marker <!-- review-fix-loop: fix-review --> and both lists; return the URL in "commentUrl". "verdict": "open" iff there is a Blocker/High in regressions or unaddressed.
 
-${gatePending ? 'NOTE: the last round zeroed High/Blocker in a TARGETED pass (depth), but the breadth fresh-eyes gate did NOT get to run — the loop capped before it. Say explicitly that exhaustion was NOT confirmed and recommend running /deep-review or a new loop as the gate.' : ''}
-
-Omit empty sections. Include the per-round severity trajectory (with each round's type — breadth/depth/gate — and whether the enumeration came dry) and that the loop stopped awaiting a human decision. Telegraphic and honest — no glossing.
-
-Trajectory:
-${JSON.stringify(roundsSummary, null, 2)}
-
-Return only an empty { "findings": [] } in the schema (the comment is the effect).`
+Findings posted in the review:
+${JSON.stringify(posted, null, 2)}`
 }
 
 // ---------------------------------------------------------------------------
-// Resilience: agent({schema}) THROWS when the subagent finishes without a
-// StructuredOutput (throttling / retry cap), and a throw on a direct await takes
-// down the WHOLE workflow even though earlier agents' work is already committed
-// and pushed. Degrade to null: every call site below already has null semantics
-// (fallback, retry, or blocked). Thunks inside parallel() already resolve to
-// null via the runtime — the wrapper is for the direct awaits.
+// Resilience: agent({schema}) THROWS when the subagent finishes without a StructuredOutput
+// (throttling / retry cap), and a throw on a direct await takes down the WHOLE workflow even
+// though earlier agents' work is already committed and pushed. Degrade to null: every call site
+// below has null semantics.
 // ---------------------------------------------------------------------------
 
+let invocations = 0
+
 async function tryAgent(prompt, opts) {
+  invocations++
   try {
     return await agent(prompt, opts)
   } catch (e) {
@@ -341,309 +347,141 @@ async function tryAgent(prompt, opts) {
 }
 
 // ---------------------------------------------------------------------------
-// Hot-surface enumeration
+// Fixed structure: breadth → judge → conciliate → fix → fix-review (→ fix → fix-review, at most
+// once). There is no round loop and no exhaustion criterion: the repo's CI review on each push and
+// the human code owner are the next gates.
 // ---------------------------------------------------------------------------
 
-function hotSurfaces(findings) {
-  const hb = findings.filter((f) => f.severity === 'Blocker' || f.severity === 'High')
-  const bySurface = new Map()
-  for (const f of hb) {
-    const key = String(f.surface || f.file || f.id || 'unknown').slice(0, 80)
-    if (!bySurface.has(key)) bySurface.set(key, [])
-    bySurface.get(key).push(f)
-  }
-  const entries = [...bySurface.entries()]
-  entries.sort((a, b) => {
-    const aB = a[1].some((f) => f.severity === 'Blocker') ? 0 : 1
-    const bB = b[1].some((f) => f.severity === 'Blocker') ? 0 : 1
-    return aB - bB
+phase('Scope')
+log(`tier=${TIER} roles=${JSON.stringify(ROLE)} exclusionsLoaded=${exclusions.length}`)
+// Mode is DETERMINISTIC — no agent decides: a deep-plan contract on the branch, or a Sensitive
+// domain in the diff (config › Sensitive domains; empty means this arm never fires).
+const mode = ARGS.modeHint === 'deep' || ARGS.modeHint === 'standard'
+  ? ARGS.modeHint
+  : ((ARGS.deepPlanContractOnBranch || (ARGS.sensitiveDomains || []).length) ? 'deep' : 'standard')
+log(`mode: ${mode} (contract=${!!ARGS.deepPlanContractOnBranch}, sensitiveDomains=${JSON.stringify(ARGS.sensitiveDomains || [])})`)
+
+const scope = await tryAgent(scopePrompt(), { schema: SCOPE_RESULT, label: 'scope', phase: 'Scope', ...ROLE.scope })
+if (scope && scope.scoped === false) {
+  log(`PR NOT scoped — ${scope.problem}: the recommendation to slice it goes in the review comment (blocks nothing, changes no structure)`)
+}
+
+phase('Review')
+const lensAgents = mode === 'deep' ? DEEP_AGENTS : DEEP_AGENTS.filter((a) => STANDARD_LENSES.includes(a.key))
+const lensLabels = lensAgents.map((a) => a.key)
+const lensThunks = lensAgents.map((a) => () => {
+  invocations++
+  return agent(deepReviewPrompt(a), { schema: FINDINGS, label: `lens:${a.key}`, phase: 'Review', ...ROLE[a.role] })
+})
+if (mode === 'standard') {
+  lensLabels.unshift('standard')
+  lensThunks.unshift(() => {
+    invocations++
+    return agent(standardReviewPrompt(), { schema: FINDINGS, label: 'lens:standard', phase: 'Review', ...ROLE.standard })
   })
-  return { targets: entries.slice(0, MAX_ENUM_SURFACES), truncated: entries.length > MAX_ENUM_SURFACES }
 }
+const slices = await parallel(lensThunks)
+// A crashed lens falls to null here (under throttling an agent can exceed the StructuredOutput
+// retry cap). Breadth then ran DEGRADED — that is a warning in the result, never a clean state.
+const lensFailures = lensLabels.filter((_, i) => !slices[i])
+if (lensFailures.length) log(`breadth DEGRADED: ${lensFailures.length}/${lensLabels.length} lens(es) crashed — ${lensFailures.join(', ')}`)
 
-async function enumerateSurfaces(seedFindings, round, opts) {
-  const { targets, truncated } = hotSurfaces(seedFindings)
-  if (!targets.length) return { findings: [], dry: true, surfaces: [], unchecked: 0, truncated: false }
-  if (truncated) log(`enumeration r${round}: ${targets.length} surfaces (cap ${MAX_ENUM_SURFACES}) — excess NOT enumerated this round`)
-  const results = await parallel(targets.map(([surface, seeds]) => () =>
-    agent(enumeratePrompt(surface, seeds, round, opts), { schema: ENUM_RESULT, label: `enum:${surface.slice(0, 40)} r${round}`, phase: 'Enumerate' })
-  ))
-  const valid = results.filter(Boolean)
-  const findings = valid.flatMap((r) => (r.findings || []).map((f) => ({ ...f, surface: f.surface || r.surface, source: f.source || `enumerate:${r.surface}` })))
-  const unchecked = valid.reduce((n, r) => n + (r.facets || []).filter((x) => x.verdict === 'unchecked').length, 0)
-  // dry = every enumerator answered, no new finding, no facet without evidence, no surface beyond the cap
-  const dry = valid.length === targets.length && findings.length === 0 && unchecked === 0 && !truncated
-  log(`enumeration r${round}: ${targets.length} surfaces → ${findings.length} new finding(s), ${unchecked} unchecked facet(s)${dry ? ' — DRY' : ''}`)
-  return { findings, dry, surfaces: targets.map(([s]) => s), unchecked, truncated }
+const filteredSlices = slices.filter(Boolean).map((s) => ({ findings: applyHardFilters(s.findings, 'lens') }))
+const cons = await tryAgent(judgePrompt(filteredSlices), { schema: FINDINGS, label: 'judge', phase: 'Review', ...ROLE.judge })
+const refuted = cons?.refuted || []
+const judged = applyHardFilters(cons?.findings ?? filteredSlices.flatMap((s) => s.findings), 'judge')
+const severities = {
+  blocker: judged.filter((f) => f.severity === 'Blocker').length,
+  high: judged.filter((f) => f.severity === 'High').length,
+  medium: judged.filter((f) => f.severity === 'Medium').length,
+  low: judged.filter((f) => f.severity === 'Low').length,
 }
+log(`breadth: ${severities.blocker} Blocker · ${severities.high} High · ${severities.medium} Medium · ${severities.low} Low (counted, not posted) · ${refuted.length} refuted by the judge`)
 
-// ---------------------------------------------------------------------------
-// Phases
-// ---------------------------------------------------------------------------
-
-phase('Classify')
-let mode = ARGS.modeHint === 'deep' || ARGS.modeHint === 'standard' ? ARGS.modeHint : null
-if (mode) {
-  log(`mode forced by the user: ${mode}`)
-} else {
-  const c = await tryAgent(classifyPrompt(), { schema: CLASSIFY_RESULT, label: 'classify' })
-  mode = c?.mode === 'deep' ? 'deep' : 'standard'
-  log(`mode: ${mode} — ${c?.reason || 'classifier died; fallback standard'}`)
-}
+phase('Conciliate')
+const con = await tryAgent(conciliatePrompt(judged, scope), { schema: CONSOLIDATED, label: 'conciliate', phase: 'Conciliate', ...ROLE.conciliate })
+const posted = con?.findings ?? judged
+log(`review posted: ${con?.commentUrl || 'comment not confirmed'}`)
 
 const state = { fixed: [], diverged: [] }
-const roundsSummary = []
 const allCommits = []
-const seenIds = new Set()
-const mediumAge = new Map()
-let effectiveMax = MAX_ROUNDS
-let extensionsUsed = 0
-let gateExtensionUsed = 0
-let pendingGate = false
-let lastHighBlocker = []
-let lastFixResult = null
-let finalStatus = 'capped'
+const fixReviews = []
+let finalStatus = 'done'
 let blockedReason = null
-// Lenses (deep) that crashed in a breadth/gate round — under throttling, agents can exceed the
-// StructuredOutput retry cap and fall to null in the parallel fan-out. A breadth round with missing
-// lenses does NOT confirm exhaustion; the verdict becomes clean-partial and the orchestrator runs a
-// confirmation pass.
-const lensFailures = []
-// Scoped gate (profile=direct): lenses that produced ≥1 finding in some breadth round are the
-// signal; the gate re-runs only those + negative-space + contract×code. The full fan-out returns
-// if ANY Blocker appeared in the loop (a fix regression is exactly when full fresh eyes pay).
-// Exhaustion declared by a scoped gate covers the scoped set — a deliberate, logged cadence
-// decision, not a silent shortcut.
-const lensHits = new Set()
-let sawBlocker = false
-const GATE_CORE_LENSES = ['negspace', 'contract']
-function gateAgents() {
-  if (PROFILE !== 'direct' || sawBlocker) return DEEP_AGENTS
-  const scoped = DEEP_AGENTS.filter((a) => lensHits.has(a.key) || GATE_CORE_LENSES.includes(a.key))
-  return scoped.length ? scoped : DEEP_AGENTS
-}
+let assigned = posted.filter((f) => f.severity !== 'Low')
 
-for (let round = 1; round <= effectiveMax; round++) {
-  let freshFindings = []
-  let enumInfo = { findings: [], dry: true, surfaces: [], unchecked: 0, truncated: false }
-  let roundKind
-  let roundDegradedLenses = [] // keys of the lenses that crashed THIS round (empty outside breadth/gate)
-  let roundLenses = null // number of lenses that ran this round (breadth/gate; null otherwise)
-
-  if (mode === 'standard') {
-    // --- Standard: 1 breadth reviewer per round (simple PRs; no enumeration) ---
-    roundKind = 'standard'
-    const r = await tryAgent(standardReviewPrompt(round), { schema: FINDINGS, label: `review r${round}`, phase: 'Review' })
-    freshFindings = r?.findings ?? []
-  } else if (round === 1 || pendingGate) {
-    // --- Breadth (round 1 or fresh-eyes gate): fan-out of the lens set + consolidation + enumeration.
-    // On the gate with profile=direct (and no Blocker in the loop), the fan-out is SCOPED — see gateAgents. ---
-    roundKind = pendingGate ? 'gate' : 'breadth'
-    pendingGate = false
-    const roundAgents = roundKind === 'gate' ? gateAgents() : DEEP_AGENTS
-    if (roundAgents.length < DEEP_AGENTS.length) {
-      log(`gate SCOPED (profile=direct, 0 Blockers in the loop): ${roundAgents.length}/${DEEP_AGENTS.length} lenses — ${roundAgents.map((a) => a.key).join(', ')}; lenses with no signal in breadth rounds sit out (cadence decision; exhaustion is confirmed over this set)`)
-    }
-    roundLenses = roundAgents.length
-    const slices = await parallel(roundAgents.map((a) => () =>
-      agent(deepReviewPrompt(a, round, roundKind), { schema: FINDINGS, label: `deep:${a.key} r${round}`, phase: 'Review' })
-    ))
-    // Crashed lenses fall to null here. Record them to downgrade clean→clean-partial: a "clean" verdict
-    // over a partial lens set is FALSE-clean (a loop can go clean with a crashed lens; a confirmation pass
-    // catches a High that the missing lens would have found).
-    roundDegradedLenses = roundAgents.filter((_, i) => !slices[i]).map((a) => a.key)
-    if (roundDegradedLenses.length) {
-      lensFailures.push({ round, kind: roundKind, lenses: roundDegradedLenses })
-      log(`round ${round} (${roundKind}): ${roundDegradedLenses.length}/${roundAgents.length} lens(es) crashed — ${roundDegradedLenses.join(', ')}; breadth coverage DEGRADED (exhaustion not confirmable by these lenses)`)
-    }
-    slices.forEach((s, i) => { if (s && (s.findings || []).length) lensHits.add(roundAgents[i].key) })
-    const valid = slices.filter(Boolean)
-    const cons = await tryAgent(consolidatePrompt(valid, round), { schema: FINDINGS, label: `consolidate r${round}`, phase: 'Review' })
-    const consolidated = cons?.findings ?? valid.flatMap((s) => s.findings || [])
-    enumInfo = await enumerateSurfaces(consolidated, round, { postFix: false })
-    freshFindings = consolidated.concat(enumInfo.findings)
-  } else {
-    // --- Depth (rounds 2+): bounded validator + fix-diff + re-enumeration of the just-fixed surfaces.
-    // A fix regression is rare and local (2/28 in the audited run, both caught the round they were born) —
-    // a full re-sweep every round pays for coverage that already exists; breadth returns only at the gate. ---
-    roundKind = 'depth'
-
-    // 1. Validate the previous round's fix claims (scope closed to the ids)
-    let stillOpen = []
-    const fixedById = new Map((lastFixResult?.fixed || []).map((f) => [f.id, f.note || '']))
-    const claims = lastHighBlocker.filter((f) => fixedById.has(f.id)).map((f) => ({ ...f, fixNote: fixedById.get(f.id) }))
-    if (claims.length) {
-      const val = await tryAgent(validationPrompt(claims, lastFixResult, false), { schema: VALIDATION_RESULT, label: `validate r${round}`, phase: 'Review' })
-      if (val) {
-        const stillById = new Map((val.stillOpen || []).map((s) => [s.id, s.why]))
-        stillOpen = claims.filter((c) => stillById.has(c.id)).map((c) => ({ ...c, description: `${String(c.description).slice(0, 280)} [validator: ${stillById.get(c.id)}]`.slice(0, 500), source: 'post-fix validator' }))
-      } else {
-        // validator died — re-enter everything to be safe; the conciliator verifies B/H in the code before posting
-        stillOpen = claims.map((c) => ({ ...c, source: 'validator died — re-entered to be safe' }))
-      }
-    }
-
-    // 2. Fix-diff review: only the delta of the fixer's commits (catches fix-introduced defects next round)
-    let fdFindings = []
-    const commits = lastFixResult?.commits || []
-    if (commits.length) {
-      const fd = await tryAgent(fixDiffPrompt(commits, round), { schema: FINDINGS, label: `fixdiff r${round}`, phase: 'Review' })
-      fdFindings = (fd?.findings ?? []).map((f) => ({ ...f, source: f.source || 'fix-diff' }))
-    }
-
-    // 3. Re-enumerate the surfaces of the previous round's B/H (the fixer just touched them)
-    enumInfo = await enumerateSurfaces(lastHighBlocker, round, { postFix: true, commits })
-
-    freshFindings = stillOpen.concat(fdFindings, enumInfo.findings)
-  }
-
-  // --- Conciliate (the only stage that reads the PR history; posts the consolidated review) ---
-  const con = await tryAgent(
-    conciliatePrompt(freshFindings, state, round, mode, roundKind, Object.fromEntries(mediumAge)),
-    { schema: CONSOLIDATED, label: `conciliate r${round}`, phase: 'Conciliate' }
-  )
-  const findings = con?.findings ?? freshFindings
-  const highBlocker = findings.filter((f) => f.severity === 'Blocker' || f.severity === 'High')
-  const mediumLow = findings.filter((f) => f.severity === 'Medium' || f.severity === 'Low')
-  if (findings.some((f) => f.severity === 'Blocker')) sawBlocker = true
-
-  // --- Medium aging: ≥2 rounds in the queue → no longer optional for the fixer ---
-  findings.filter((f) => f.severity === 'Medium').forEach((f) => mediumAge.set(f.id, (mediumAge.get(f.id) || 0) + 1))
-  const agedMediums = findings.filter((f) => f.severity === 'Medium' && (mediumAge.get(f.id) || 0) >= 2)
-
-  roundsSummary.push({
-    round,
-    kind: roundKind,
-    blocker: findings.filter((f) => f.severity === 'Blocker').length,
-    high: findings.filter((f) => f.severity === 'High').length,
-    medium: findings.filter((f) => f.severity === 'Medium').length,
-    low: findings.filter((f) => f.severity === 'Low').length,
-    enumDry: enumInfo.dry,
-    enumSurfaces: enumInfo.surfaces.length,
-    agedMediums: agedMediums.length,
-    degraded: roundDegradedLenses.length,
-    lenses: roundLenses,
-    commentUrl: con?.commentUrl,
-  })
-  log(`round ${round} (${roundKind}): ${highBlocker.length} High/Blocker · ${mediumLow.length} Medium/Low · enum ${enumInfo.dry ? 'dry' : 'NOT dry'} — ${con?.commentUrl || 'comment not confirmed'}`)
-
-  // --- Dynamic cap: a Blocker with a never-seen id at the cap round = a fix-introduced regression; stopping now is worst ---
-  const newBlockers = findings.filter((f) => f.severity === 'Blocker' && !seenIds.has(f.id))
-  findings.forEach((f) => seenIds.add(f.id))
-  if (round === effectiveMax && highBlocker.length > 0 && newBlockers.length > 0 && extensionsUsed < MAX_EXTENSIONS) {
-    effectiveMax++
-    extensionsUsed++
-    log(`round ${round} (cap) found never-seen Blocker(s): ${newBlockers.map((b) => b.id).join(', ')} — cap extended to ${effectiveMax} (extension ${extensionsUsed}/${MAX_EXTENSIONS}); re-disputing an already-seen id does not extend`)
-  }
-
-  lastHighBlocker = highBlocker
-
-  // --- Termination by exhaustion: 0 High/Blocker in a BREADTH round with a dry enumeration.
-  // A depth round with 0 H/B only schedules the fresh-eyes gate — quiet is not exhausted. ---
-  if (highBlocker.length === 0) {
-    const exhausted = mode === 'standard' || (roundKind !== 'depth' && enumInfo.dry)
-    if (exhausted) {
-      if (mediumLow.length) {
-        const fin = await tryAgent(fixerPrompt(mediumLow, round, { finalRound: true }), { schema: FIX_RESULT, label: 'final-fix (medium/low)', phase: 'Fix' })
-        if (fin?.status === 'done') {
-          state.fixed.push(...(fin.fixed || []))
-          state.diverged.push(...(fin.diverged || []))
-          allCommits.push(...(fin.commits || []))
-        } else {
-          log(`final Medium/Low round stalled: ${fin?.blockedReason || 'no result'} — pending items documented on the PR`)
-        }
-      }
-      // If the confirming round ran with crashed lenses, exhaustion only holds for the ones that ran —
-      // clean-partial signals to the orchestrator that a confirmation pass over the lenses in lensFailures is missing.
-      finalStatus = roundDegradedLenses.length ? 'clean-partial' : 'clean'
-      break
-    }
-    pendingGate = true
-    if (round === effectiveMax && gateExtensionUsed < 1) {
-      effectiveMax++
-      gateExtensionUsed++
-      log(`round ${round} (${roundKind}) zeroed High/Blocker but exhaustion not confirmed — cap extended by +1 for the fresh-eyes gate`)
-    } else if (round === effectiveMax) {
-      log(`round ${round} zeroed High/Blocker but the fresh-eyes gate doesn't fit in the cap — loop ends capped with 0 open and exhaustion NOT confirmed`)
-    } else {
-      log(`round ${round} (${roundKind}) zeroed High/Blocker — next round is the fresh-eyes breadth gate`)
-    }
-    continue
-  }
-
-  // --- Fix Blocker/High + aged Mediums (on the last possible round: full verify) ---
-  const assigned = highBlocker.concat(agedMediums.filter((m) => !highBlocker.some((h) => h.id === m.id)))
-  const fix = await tryAgent(
-    fixerPrompt(assigned, round, {
-      finalRound: false,
-      mustFullVerify: round === effectiveMax,
-      agedMediums,
-      mediumsInSameFiles: mediumLow.filter((m) => !agedMediums.some((a) => a.id === m.id) && highBlocker.some((h) => h.file && h.file === m.file)),
-    }),
-    { schema: FIX_RESULT, label: `fix r${round}`, phase: 'Fix' }
-  )
+for (let pass = 1; pass <= 2 && assigned.length; pass++) {
+  phase('Fix')
+  const suffix = pass === 2 ? '-2' : ''
+  const fix = await tryAgent(fixerPrompt(assigned, { second: pass === 2 }), { schema: FIX_RESULT, label: `fix${suffix}`, phase: 'Fix', ...ROLE.fixer })
   if (!fix || fix.status === 'blocked') {
     finalStatus = 'blocked'
     blockedReason = fix?.blockedReason || 'fixer died with no result'
     break
   }
-  lastFixResult = fix
   state.fixed.push(...(fix.fixed || []))
   state.diverged.push(...(fix.diverged || []))
   allCommits.push(...(fix.commits || []))
-  // Fixed Mediums leave the aging queue
-  ;(fix.fixed || []).forEach((f) => mediumAge.delete(f.id))
-  log(`round ${round} fix: ${(fix.fixed || []).length} fixed, ${(fix.diverged || []).length} divergence(s), ${(fix.commits || []).length} commit(s)`)
+  log(`fix ${pass}: ${(fix.fixed || []).length} fixed, ${(fix.diverged || []).length} divergence(s), ${(fix.commits || []).length} commit(s)`)
+
+  phase('Fix-review')
+  const fr = await tryAgent(
+    fixReviewPrompt(assigned, fix.commits || [], { second: pass === 2 }),
+    { schema: FIX_REVIEW, label: `fix-review${suffix}`, phase: 'Fix-review', ...ROLE.fixReview }
+  )
+  if (!fr) {
+    fixReviews.push({ pass, verdict: 'unknown' })
+    log(`fix-review ${pass} crashed — the fix is still pushed; the CI review and the human reviewer are the gates`)
+    assigned = []
+    break
+  }
+  const regressions = applyHardFilters(fr.regressions, 'fix-review')
+  const unaddressed = (fr.unaddressed || []).filter((u) => !state.diverged.some((d) => d.id === u.id))
+  fixReviews.push({ pass, verdict: fr.verdict, regressions: regressions.length, unaddressed: unaddressed.length, commentUrl: fr.commentUrl })
+  log(`fix-review ${pass}: ${fr.verdict} — ${regressions.length} regression(s), ${unaddressed.length} unaddressed`)
+
+  // Blocker/High from the fix-review buys ONE second fix, and only one: after it the gates are the
+  // repo's CI review on the push and the human code owner. Medium/Low from a fix-review never reopen.
+  const stillOpen = regressions
+    .filter((f) => f.severity === 'Blocker' || f.severity === 'High')
+    .concat(unaddressed
+      .filter((u) => u.severity === 'Blocker' || u.severity === 'High')
+      .map((u) => assigned.find((f) => f.id === u.id) || { id: u.id, severity: u.severity, title: u.id, description: u.why, confidence: MIN_CONFIDENCE }))
+  assigned = stillOpen
+  if (pass === 2 && stillOpen.length) {
+    log(`${stillOpen.length} Blocker/High still open after the 2nd fix-review — left to the CI review and the human reviewer`)
+  }
 }
 
-// --- Post-cap reconciliation: the last review (pre-fix) and the last fix are different instants.
-// A raw openHighBlocker from the cap round would report as open what the fixer just addressed.
-let openHighBlocker = finalStatus === 'clean' || finalStatus === 'clean-partial' ? [] : lastHighBlocker
-let fixedValidated = []
-let fixedUnreviewed = []
-let contestedUnreviewed = []
-if (finalStatus === 'capped') {
-  const lastFixedById = new Map((lastFixResult?.fixed || []).map((f) => [f.id, f.note || '']))
-  const lastDivergedIds = new Set((lastFixResult?.diverged || []).map((d) => d.id))
-  contestedUnreviewed = lastHighBlocker.filter((f) => lastDivergedIds.has(f.id))
-  const claimedFixed = lastHighBlocker
-    .filter((f) => lastFixedById.has(f.id))
-    .map((f) => ({ ...f, fixNote: lastFixedById.get(f.id) }))
-  openHighBlocker = lastHighBlocker.filter((f) => !lastFixedById.has(f.id) && !lastDivergedIds.has(f.id))
-
-  if (claimedFixed.length) {
-    // "fixed" is the fixer's claim — bounded validation (1 agent, scope closed to the ids), not a new review.
-    const val = await tryAgent(validationPrompt(claimedFixed, lastFixResult, true), { schema: VALIDATION_RESULT, label: 'fix-validation post-cap', phase: 'Fix' })
-    if (val) {
-      const resolvedById = new Map((val.resolved || []).map((r) => [r.id, r.evidence || '']))
-      const stillOpenById = new Map((val.stillOpen || []).map((s) => [s.id, s.why]))
-      fixedValidated = claimedFixed.filter((f) => resolvedById.has(f.id)).map((f) => ({ ...f, evidence: resolvedById.get(f.id) }))
-      openHighBlocker = openHighBlocker.concat(
-        claimedFixed.filter((f) => stillOpenById.has(f.id)).map((f) => ({ ...f, validatorNote: stillOpenById.get(f.id) }))
-      )
-      fixedUnreviewed = claimedFixed.filter((f) => !resolvedById.has(f.id) && !stillOpenById.has(f.id))
-    } else {
-      fixedUnreviewed = claimedFixed
-    }
-  }
-
-  await tryAgent(cappedCommentPrompt({ open: openHighBlocker, fixedValidated, fixedUnreviewed, contested: contestedUnreviewed }, roundsSummary, pendingGate), { schema: FINDINGS, label: 'capped-comment', phase: 'Conciliate' })
+// Acceptance rate: posted → addressed by a commit. A reading metric in the report, NEVER a stopping criterion.
+const assignedIds = new Set(posted.filter((f) => f.severity !== 'Low').map((f) => f.id))
+const fixedIds = new Set(state.fixed.map((f) => f.id).filter((id) => assignedIds.has(id)))
+const acceptance = {
+  assigned: assignedIds.size,
+  fixed: fixedIds.size,
+  diverged: state.diverged.length,
+  rate: assignedIds.size ? Number((fixedIds.size / assignedIds.size).toFixed(2)) : null,
 }
 
 return {
   status: finalStatus,
   mode,
-  profile: PROFILE,
-  rounds: roundsSummary,
-  extensionsUsed,
-  gateNeverRan: finalStatus === 'capped' && pendingGate,
-  lensFailures, // [] if no lens crashed; non-empty ⇒ some breadth/gate round ran degraded (partial exhaustion)
+  tier: TIER,
+  roles: ROLE,
+  scope,
+  invocations,
+  severities,
+  reviewCommentUrl: con?.commentUrl,
+  exclusionsLoaded: exclusions.length,
+  droppedByConfidence,
+  droppedByExclusion,
+  refuted,
+  lensFailures, // non-empty ⇒ breadth ran degraded; say so in the report
+  fixReviews,
+  openHighBlocker: assigned,
+  acceptance,
   commits: allCommits,
   fixed: state.fixed,
   diverged: state.diverged,
-  openHighBlocker,
-  fixedValidated,
-  fixedUnreviewed,
-  contestedUnreviewed,
   blockedReason,
 }

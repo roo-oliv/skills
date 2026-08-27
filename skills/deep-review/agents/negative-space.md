@@ -67,12 +67,32 @@ For each entity whose status drives a changed filter: list the FULL enum and
 classify every value as deliberately-in / deliberately-out / unhandled.
 `else`/`default` branches that silently bucket unknown statuses are findings.
 
+## Step 6: Dispositions of the cases the diff handles
+
+Every case a diff handles carries one of four dispositions, and the disposition must
+be visible in the diff:
+
+1. **inexpressible** — the type/state model cannot represent the case;
+2. **validated at the boundary** — once, producing a typed error;
+3. **supported** — with a test that exercises it;
+4. **impossible** — an assertion (`require`/`check`/`assert`, in the repo's idiom) at the
+   seam, and no branch.
+
+A handled case with **no** disposition is a finding: a defensive branch nothing can
+reach, a silent fallback that swallows a state, a broad catch with no disposition, or
+an *impossible* case handled by a conditional instead of an assertion at the seam
+(the conditional hides the violation instead of failing on it). Grade Medium, or High
+when it masks a load-bearing value or state. **Boundary complement:** tolerate what an
+external provider may *add* (unknown fields), never what *violates* its spec (a missing
+required field, a wrong type, a value out of range) — silent recovery entrenches the bug
+downstream; the seam must fail loudly.
+
 ## Output format
 
 Use the standard severity-bucket format (Blockers / High / Medium / Low /
 Positive observations). For each finding state: the scope, its complement, the
-concrete path into the complement, and what is lost there (with cents when
-money). After the buckets, add a `## Complements checked` table — one row per
+concrete path into the complement, and what is lost there (in the smallest unit
+when the loss is a quantity). After the buckets, add a `## Complements checked` table — one row per
 scope with verdict and evidence, so "checked and clean" is distinguishable from
 "not checked".
 
