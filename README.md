@@ -39,9 +39,9 @@ same config.
 
 | Toolkit | Pieces | Doc |
 |---|---|---|
-| **Context** | `context_lint.py` (CI gate: ceilings, frontmatter, every reference that must resolve), `premise.py` (read ONE premise by stable id), `context_decay.py` (monthly: what stopped describing anything alive), `context_hooks.py` (puts a domain's premises index on the *reasoning* path), `deep-plan-pr-gate.sh`, `rules/{context,premises}.md` | [`docs/context-toolkit.md`](docs/context-toolkit.md) |
-| **Telemetry** | `agent_telemetry.py` (which surface loaded, and why — per file and per premise), `otel_headers.py` (OTLP auth header from a repo variable), `settings/env.json` | [`docs/telemetry.md`](docs/telemetry.md) |
-| **Lint ratchet** | `lint_ratchet.py` (`config-rides-alone`, `cpd-delta`), `refactor_ratio.py` + its workflow example | [`docs/lint-ratchet.md`](docs/lint-ratchet.md) |
+| **Context** | `ci/context_lint.py` (CI gate: ceilings, frontmatter, every reference that must resolve), `ci/premise.py` (read ONE premise by stable id), `ci/context_decay.py` (monthly: what stopped describing anything alive), `hooks/context_hooks.py` (puts a domain's premises index on the *reasoning* path), `hooks/deep-plan-pr-gate.sh`, `rules/context.md`, `rules/premises.md` | [`docs/context-toolkit.md`](docs/context-toolkit.md) |
+| **Telemetry** | `ci/agent_telemetry.py` (which surface loaded, and why — per file and per premise), `ci/otel_headers.py` (OTLP auth header from a repo variable), `settings/env.json` | [`docs/telemetry.md`](docs/telemetry.md) |
+| **Lint ratchet** | `ci/lint_ratchet.py` (`config-rides-alone`, `cpd-delta`), `ci/refactor_ratio.py` + its workflow example | [`docs/lint-ratchet.md`](docs/lint-ratchet.md) |
 
 ## How portability works
 
