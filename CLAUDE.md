@@ -38,15 +38,30 @@ file runs on a Kotlin backend, a TS app, and a C# game engine.
   workflow edit by wrapping it in an async fn and running `node --check` (top-level `return`
   isn't valid bare).
 - **Hooks / scripts** are POSIX-ish bash; validate with `bash -n`.
-- **The context toolkit** (`ci/*.py`, `hooks/*`, `rules/*.md`, `settings/hooks.json`) is Python 3 stdlib only,
-  ≥ 3.9, and reads the same `docs/agents/skills-config.md` the skills do — via `ci/skills_config.py`, never a
-  constant. Every check has a red case in its `*_test.py`, and the suite must be green here:
-  `python3 -m unittest discover -s ci -p '*_test.py'`. What each piece does: [`docs/context-toolkit.md`](docs/context-toolkit.md).
+- **`ci/*.py`** — Python 3 **stdlib only, ≥ 3.9**, 120 columns, and every path/glob/threshold read from
+  `docs/agents/skills-config.md` via `ci/skills_config.py`, never a constant. Each script has a
+  `<name>_test.py` beside it whose red case was **executed** before the commit (a gate nobody has seen red
+  proves nothing), and the whole suite must be green here:
+  `python3 -m unittest discover -s ci -p '*_test.py'`. The installer vendors the tests too, so the same
+  command runs in the consuming repo's CI. A script that needs configuration it does not have **skips and
+  passes with a printed reason** — it never guesses a default that could fail a build.
+- **`hooks/*`** — POSIX-ish bash or stdlib Python, fail-open by contract: never write to stdout unless the
+  hook contract asks for it, always exit 0, always carry a `timeout`.
+- **`rules/*.md`** — vendored to the consumer's `.claude/rules/`. Frontmatter carries **only**
+  `description` and (optionally) `paths`; no `paths:` means always-on, which is a budget decision, not a
+  default. Imperative and dry — the *why* belongs in the doc it points at.
+- **`settings/*.json`** — fragments, not files to copy: `install.sh` merges them key by key into the
+  consumer's `.claude/settings.json`, and the consumer's own value always wins. Keep each fragment to one
+  concern (`hooks.json`, `env.json`) and never write a key the consumer would want to own without knowing.
+- What each toolkit does and why: [`docs/context-toolkit.md`](docs/context-toolkit.md),
+  [`docs/telemetry.md`](docs/telemetry.md), [`docs/lint-ratchet.md`](docs/lint-ratchet.md).
 
 ## When you add or rename a skill
 
 - Add its directory to `.claude-plugin/plugin.json` if it's a pure-prose skill (no `.js`).
 - If it invokes a workflow, the workflow goes in `workflows/` and the SKILL.md calls
   `Workflow({ scriptPath: ".claude/workflows/<name>.js", args: { repoRoot, … } })`.
-- Make sure `scripts/install.sh` still copies it (it globs `skills/`, `workflows/`, `hooks/`).
-- Update this file's skill list and the README table.
+- Make sure `scripts/install.sh` still copies it (it globs `skills/*/`, `workflows/*.js`, `hooks/*`,
+  `rules/*.md`, `ci/*.py`, and merges `settings/*.json`). A brand-new **top-level directory** needs a new
+  loop there.
+- Update the README tables — the skill list, the toolkit table and the repo layout block.
