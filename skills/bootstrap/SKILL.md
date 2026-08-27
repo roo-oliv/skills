@@ -51,7 +51,7 @@ Tenets can't be fully mined — they're the *why*. Interview the user (`AskUserQ
 - "What are the 3–7 things that must always be true in this codebase that a newcomer would get
   wrong?" — the load-bearing invariants.
 - "What's the architectural stance — what does this system deliberately do differently from the
-  obvious approach, and why?" (e.g. "framework not library", "money is always integer cents",
+  obvious approach, and why?" (e.g. "framework not library", "amounts are always integer minor units",
   "ECS purity: components are pure data".)
 - "Who are the readers of these docs?" — if AI agents are first-class readers, say so in the
   file; it changes how much context to write.
@@ -71,6 +71,7 @@ write a premises file at the configured path. Each premise is an H2:
 Brief domain context (2–3 lines).
 
 ## {Short declarative premise title}
+**Id:** {p-xxxxxxxx — mint one with `python3 .github/scripts/premise.py mint`}
 
 {One paragraph: what is true and must remain true.}
 
@@ -82,16 +83,26 @@ Brief domain context (2–3 lines).
 
 Rules:
 - A premise must be **falsifiable** — phrased so a test *could* break if it were violated. "The
-  system is robust" is not a premise; "a ReceivableSettlement is never updated or deleted" is.
+  system is robust" is not a premise; "a settled ledger row is never updated or deleted" is.
 - Mine real ones first (from guards/tests/comments in step 1); propose them to the user before
   inventing. `**Tests:** none yet` is an acceptable starting state for a pre-existing invariant
   — flag it as a follow-up, don't block.
 - Where a load-bearing invariant has no executable guard, note it — `deep-plan`/`deep-review`
   will later suggest a `require`/`check` seam.
 
+**Ids and the index.** Every premise carries a stable `**Id:**` right below its H2 — that is the handle
+readers fetch one section by, and it survives a retitle or a file split, which a title does not. If the
+repo vendors the context toolkit (`.github/scripts/premise.py`), mint ids with
+`python3 .github/scripts/premise.py mint` while drafting, then run
+`python3 .github/scripts/premise.py assign-missing` to cover anything you missed and
+`python3 .github/scripts/context_lint.py --write-indices` to generate each domain's
+`premises-index.md`. **Commit the generated indices** — they are what every review and planning lens is
+handed instead of the whole premises file, and the linter (C15/C17) fails a PR where they drift or an id
+is missing. Never hand-write an index.
+
 ## 4. Flow docs — one per key flow
 
-A **flow** is a path that data / state / money takes through the system that must be reasoned
+A **flow** is a path that data, state or value takes through the system that must be reasoned
 about as a whole (a payment pipeline, a level-load sequence, an auth handshake). `deep-review`
 spawns a dedicated lens per flow doc, so this is where a repo declares the domain-specific review
 knowledge that used to be hardcoded. Interview for them:
@@ -107,13 +118,27 @@ Set the frontmatter `covers:` globs so the lens only runs when the flow is touch
 flow from the code (trace it end-to-end) before writing; don't invent flows the repo doesn't have
 — a repo with no load-bearing flows declares none, and the universal lenses still run.
 
-## 5. Index (optional)
+## 5. Lifecycle scaffolding
+
+Three small files the pipeline and the context toolkit expect. Each has a template beside this skill —
+copy it, fill the `{…}` placeholders, and skip any the repo already has (never overwrite).
+
+| Write | From | Why |
+|---|---|---|
+| `<intent dir>/README.md` (config › Intent, default `intent/`) | [intent-readme.template.md](./intent-readme.template.md) | the artifact chain `refine` writes and `implement` reads; it lives outside the published docs tree on purpose |
+| `docs/planning/recurring-failure-modes.md` (config › Docs layout › Planning) | [recurring-failure-modes.template.md](./recurring-failure-modes.template.md) | the ledger `/deep-plan` answers and `/review-fix-loop` writes to — including the `review-exclusions` block the review reads. Scaffold it **empty**: an entry earns its place by having happened |
+| `docs/runbooks/context-decay.md` | [context-decay.template.md](./context-decay.template.md) | the monthly round that retires surface describing nothing alive — only if the repo vendors `context_decay.py` |
+
+Ask before writing the decay runbook: it commits someone to a monthly routine. If nobody owns it, say so
+and skip it rather than scaffolding a procedure nobody runs.
+
+## 6. Index (optional)
 
 If the repo uses a docs index (or the user wants one), write/update `docs/index.md` (or the
 repo's convention) listing the tenets file, each domain's premises, and each flow doc with a
 one-line hook, so the set is discoverable.
 
-## 6. Confirm and write
+## 7. Confirm and write
 
 Show drafts before writing. Write `CORE_TENETS.md`, the premises files, and the flow docs at the
 configured paths. Tell the user which domains still need premises and which flows still need docs
