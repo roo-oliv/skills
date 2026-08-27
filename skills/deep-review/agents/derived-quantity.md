@@ -59,9 +59,9 @@ explicitly rather than skipping silently.
    the clock of every quantity it is compared to or subtracted from? Check
    D-1 / business-day / webhook-lag / timezone edges.
 
-4. **Unit, base and cap.** Tag the base of the quantity — for a monetary value
+4. **Unit, base and cap.** Tag the base of the quantity — for a value in currency
    that means `face` / `residual` / `principal-only` / `with-interest` /
-   `net-of-reserved` / `discount-net`; for a non-monetary one it means the unit
+   `net-of-reserved` / `discount-net`; for any other kind it means the unit
    and reference point the number is measured against. Verify every arithmetic
    op combines consistent bases (a discount applied to `face` instead of
    `residual`, or two counts on different scopes added together, is the bug).

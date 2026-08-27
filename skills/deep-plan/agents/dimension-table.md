@@ -6,11 +6,11 @@ your sibling lens hunts derived-quantity bugs in a *diff*; here you work
 impossible to write into the plan.
 
 A dimension-table row exists for **every load-bearing derived value the change
-introduces, reads, or recomputes** — monetary or otherwise. Money is the
-canonical example (a settle amount applied to `face` instead of `residual`, an
-uncapped mint), but the same discipline applies to any quantity a downstream
-reader depends on: a count, a window-bounded sum, a snapshot delta, a ratio, an
-index. Each gets tagged with its **base·unit**, its **cap**, and the
+introduces, reads, or recomputes** — a value in currency or any other kind. A
+settlement amount applied to `face` instead of `residual`, or an uncapped mint,
+is the canonical example, but the same discipline applies to any quantity a
+downstream reader depends on: a count, a window-bounded sum, a snapshot delta, a
+ratio, an index. Each gets tagged with its **base·unit**, its **cap**, and the
 **executable seam** (`require`/`check`) that enforces the cap — so an emergent
 code path trips the invariant, not only the one path a test enumerates.
 
@@ -35,9 +35,9 @@ When the change touches one of the repo's **Sensitive domains**
 (`docs/agents/skills-config.md` › Sensitive domains), this lens is load-bearing.
 The **flow docs** (`docs/agents/skills-config.md` › Flows) name the
 derived-quantity concern this repo cares about — read them and apply the matching
-one to this change. The backend example, for reference, is a money flow with a
-reconciliation invariant (`sum(active receivable amounts per charge) ==
-charge.amount`), a transfer rule (only custodied money is paid out), and a
+one to this change. A worked example, for reference, is a value-movement flow
+with a reconciliation invariant (`sum(active receivable amounts per charge) ==
+charge.amount`), a custody rule (only value actually held is paid out), and a
 discount-before-date rule (a discount reduces the *residual*, never the face
 `totalAmount` — the phantom-discount bug class). Your repo's invariants will be
 different; read them from the core-tenets and premises docs and hold the change
@@ -48,22 +48,23 @@ sensitive — still tag every derived value, but do not block.
 
 Walk the change's data flow end-to-end as a **variable-discovery checklist**.
 For the entity/quantity the intent introduces or recomputes, trace every stage
-it passes through and list every derived value that appears. (The backend's
-canonical cascade is *Charge → Receivable → Invoice → Settlement → Cohort
-Position → Payout → Settlement Entry → Transfer*; your repo's flow is whatever
-the intent's quantity moves through.)
+it passes through and list every derived value that appears. (One shape of
+cascade, for illustration: *Charge → Receivable → Invoice → Settlement → Ledger
+Entry → Transfer*; your repo's flow is whatever the intent's quantity moves
+through.)
 
 For **each variable** discovered, emit a row:
 
 - **variable** — the code name (real, grepped — not invented).
 - **unit / base** — exactly one base label that names what the value is measured
-  in relative to its kind. For money the closed set is `face` / `residual` /
-  `principal-only` / `with-interest` / `net-of-reserved` / `discount-net`; for a
-  non-money quantity name the real base inline (a window-bounded sum vs an
+  in relative to its kind. For a value in currency the closed set is `face` /
+  `residual` / `principal-only` / `with-interest` / `net-of-reserved` /
+  `discount-net`; for any other quantity name the real base inline (a
+  window-bounded sum vs an
   instantaneous snapshot, a per-episode cumulative vs per-cycle, a ratio's
   numerator/denominator base). Under the Workflow the `unitBase` schema field is
   a closed enum whose only escape is `other` — so if the base is not one of the
-  six money labels, use `other` and **name the real base inline in the variable
+  six currency labels, use `other` and **name the real base inline in the variable
   label** (e.g. `feeDiscount (base: discount-of-fee)`). An untagged variable is
   the bug either way.
 - **cap** — the bound it must never exceed (`≤ outstanding − reserved`,

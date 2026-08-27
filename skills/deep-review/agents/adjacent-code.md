@@ -103,7 +103,7 @@ Detected from the affected domains — the canonical broad-blast-radius sites:
 
 Does the new code handle all EXISTING scenarios? If a new method filters by
 status, does it account for ALL possible states (including the
-overpayment/cancellation/expiration-equivalent edge states of this domain)?
+excess-event / cancellation / expiration-equivalent edge states of this domain)?
 
 ## Output format
 

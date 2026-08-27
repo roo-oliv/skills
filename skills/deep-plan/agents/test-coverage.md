@@ -28,7 +28,7 @@ Goal-driven execution turns every vague intent into a concrete check *written
 first, failing on the current code*:
 
 1. List every flow the intent affects (creation, transition, cancellation,
-   amendment, expiration, born-terminal, overpayment/duplicate, manual
+   amendment, expiration, born-terminal, excess/duplicate event, manual
    correction — adapt to this entity's lifecycle).
 2. For each, specify the **failing-first test** that would prove the intent's
    behavior — the test that fails on the current code today and passes once the
