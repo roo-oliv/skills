@@ -37,10 +37,68 @@ the skill substitutes per change.
 - **Core tenets:** `<path>`  <!-- e.g. docs/CORE_TENETS.md (business/architectural invariants) -->
 - **Premises:** `<pattern>`
   <!-- e.g. backend: docs/{domain}/premises.md | monodreams: {module}/docs/premises.md (colocated) | autopilot: .claude/rules/premises.md + docs/ -->
+- **Premises index** (optional but recommended): `<pattern>`  <!-- default: docs/{domain}/premises-index.md -->
+- **Premise fetch command** (optional): `<command with a <id> placeholder>`
+  <!-- default: python3 .github/scripts/premise.py <id> -->
 - **Schema** (optional): `<pattern>`  <!-- e.g. backend: docs/schema/{domain}.md -->
-- **Planning** (optional): plan-contract spec `<path>`; recurring-failure-modes `<path>`
-  <!-- e.g. backend: docs/planning/plan-contract.md, docs/planning/recurring-failure-modes.md -->
+- **Planning** (optional): plan-contract spec `<path>`; recurring-failure-modes `<path>`; plan-contract glob `<glob>`
+  <!-- e.g. backend: docs/planning/plan-contract.md, docs/planning/recurring-failure-modes.md, .claude/deep-plan/*.md -->
 - **Rules dir** (optional): `<path>`  <!-- e.g. .claude/rules/ — glob-scoped convention files the skills should honor -->
+
+**Why the index matters.** Review and planning lenses are given the domain's *premises index* — one
+line per invariant, each with a stable id — and open only the bodies they need, by id, with the fetch
+command. They are never handed the whole premises file: the `Read` tool truncates at 2000 lines, so a
+large domain silently loses its tail. With no index configured, the skills read the premises file and
+say so in their output. (The `bootstrap` skill scaffolds the index and the fetch script.)
+
+**The recurring-failure-modes doc carries two things**: the `FM-N` entries `/deep-plan` must answer,
+and a fenced ```` ```json review-exclusions ```` block at the end listing finding classes the review
+must never post (`{ id, pattern, precedent, why }`, matched case-insensitively against a finding's
+title+description). `/review-fix-loop` extracts that block in preflight and drops matching findings in
+code, before any judge sees them.
+
+## Intent
+
+Where the pipeline's planning artifacts live. Following the
+[AI-native SDLC playbook](https://claude.com/blog/the-ai-native-sdlc-playbook), each unit of work gets
+a folder whose files are committed beside the code they produced — "every stage commits an artifact the
+next stage can read":
+
+```
+<intent dir>/<slug>/
+├── intent.md   # the problem and desired outcome, in the originator's words
+├── spec.md     # requirements and design, with this repo's policies applied
+└── plan.md     # the implementation plan — files, order, risks, proof — and the Contract block
+```
+
+- **Intent dir:** `<dir>`  <!-- default: intent/ ; keep it OUT of a published docs/ tree -->
+
+Each file carries `Status: draft | approved | implemented` in its header. `refine` writes all three and
+stamps `approved`; `implement` reads `plan.md` and stamps `implemented`; `verify-plan` reconciles the
+diff against `plan.md`'s Contract block. `bootstrap` scaffolds `<intent dir>/README.md` with the
+convention. If this section is absent, the skills fall back to a gitignored `.claude/.plans/<slug>.md`
+and say so.
+
+## Models
+
+Optional. The workflows tier every subagent by role: a **decider** (judges code or a load-bearing
+quantity, or writes what ships) runs on a strong model at high effort; a **worker** (collects evidence
+under a checklist) on a cheaper model at medium. Thinking is never disabled — effort is lowered
+instead. Override any row here; anything you omit keeps the workflow's default.
+
+| Role | Model | Effort | Default |
+|---|---|---|---|
+| `decision` | `<model>` | `<high\|medium\|low>` | `opus` / `high` |
+| `worker` | `<model>` | `<...>` | `sonnet` / `medium` |
+| `fixer` | `<model>` | `<...>` | `opus` / `high` |
+| `fix-review` | `<model>` | `<...>` | `sonnet` / `high` |
+| `pr-author` | `<model>` | `<...>` | `sonnet` / `medium` |
+
+**`fix-review` must name a different model from `fixer`** — model inversion is the point: one model
+catches more bugs in another model's code than in its own. And **never set
+`CLAUDE_CODE_SUBAGENT_MODEL`** in your environment: it is first in the model-resolution order, so it
+overrides every row above and collapses the tiering (including reviewer ≠ fixer) into one model. The
+`review-fix-loop` preflight aborts if it finds the variable set.
 
 ## Domains
 
@@ -55,14 +113,14 @@ If you don't partition by domain, write a single `default` row matching everythi
 
 ## Sensitive domains
 
-Subset of the domains above where a mistake is expensive or irreversible — money movement,
+Subset of the domains above where a mistake is expensive or irreversible — value movement,
 data loss, security, safety-critical correctness. A change touching ANY of these triggers
 the **heavy path** in `deep-plan` and `deep-review` (full lens fan-out + adversarial refute
 + the PR-create gate). **May be empty** — then every change takes the light path and the
 gate never blocks.
 
 `<domain>, <domain>`
-<!-- e.g. backend: paymentgateway, storecredit, billing, debtsettlement, cohort, payout, notary | monodreams: (none — or physics, collision if you treat correctness as load-bearing) -->
+<!-- e.g. backend: payments, credits, billing, ledger, disbursement | monodreams: (none — or physics, collision if you treat correctness as load-bearing) -->
 
 ## Flows
 
@@ -72,7 +130,7 @@ base/unit/cap), negative-space (unhandled states/scope), contract×code (code vs
 it claims to satisfy), test-coverage (premises no test protects).
 
 On top of those, the review spawns **one dedicated lens per *flow* this repo declares**. A flow
-is a path that data/state/money takes through the system that must be reasoned about as a whole
+is a path that data, state or value takes through the system that must be reasoned about as a whole
 — a payment pipeline, a level-load sequence, an auth handshake. You document each one as a
 markdown file that reads like a **dedicated core-tenet for that flow**: descriptive (not review
 instructions), but carrying everything a reviewer or planner needs — the path, the entities and
@@ -86,7 +144,7 @@ Author flow docs with the `bootstrap` skill (or by hand) using the format in
 [bootstrap/flow.template.md](../bootstrap/flow.template.md). Each doc's frontmatter `covers:`
 globs decide which flows a given change touches — only those flows' lenses run. No flows dir, or
 no flow docs → only the universal lenses run.
-<!-- e.g. backend: docs/flows/{payment-pipeline,settlement,dsa-lifecycle,payout}.md
+<!-- e.g. backend: docs/flows/{payment-pipeline,settlement,refund-lifecycle,disbursement}.md
      monodreams: docs/flows/{level-load,collision-resolution,render-pass}.md
      a repo with no load-bearing flows: none — the universal lenses are enough. -->
 
