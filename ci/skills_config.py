@@ -46,8 +46,12 @@ DEFAULTS = {
     "source_globs": [],
     "migration_dirs": [],
     "migration_pattern": r"\bV[0-9]{2,3}(?:__[a-z0-9_]+\.[a-z]+)?\b",
-    # Telemetry. The endpoint default is the OTLP one (a collector or vendor agent on the machine);
-    # a hosted intake goes in the config. The header default is Datadog's, the one example measured.
+    # Telemetry. Lane A (git-only) is the default and needs no vendor: the trailers the commit gate
+    # writes are mined out of the branch log. Lane B (otlp) is the cost axis, and only then do the
+    # endpoint/key values below mean anything — the endpoint default is the OTLP one (a collector or
+    # vendor agent on the machine); the header default is one measured example, not a requirement.
+    "telemetry_lanes": "git-only",
+    "default_branch": "main",
     "otel_endpoint": "http://localhost:4318",
     "otel_protocol": "http/protobuf",
     "otel_key_variable": "CLAUDE_CODE_OTEL_API_KEY",
@@ -264,6 +268,8 @@ class Config:
     source_globs: list[str] = field(default_factory=list)
     migration_dirs: list[str] = field(default_factory=list)
     migration_pattern: str = DEFAULTS["migration_pattern"]
+    telemetry_lanes: str = DEFAULTS["telemetry_lanes"]
+    default_branch: str = DEFAULTS["default_branch"]
     otel_endpoint: str = DEFAULTS["otel_endpoint"]
     otel_protocol: str = DEFAULTS["otel_protocol"]
     otel_resource_attributes: str | None = None
@@ -282,6 +288,11 @@ class Config:
     notes: list[str] = field(default_factory=list)
 
     # ── derived ───────────────────────────────────────────────────────────────────────────────
+
+    @property
+    def otlp_enabled(self) -> bool:
+        """Is lane B on? The OTLP env block and the header helper are installed only when it is."""
+        return self.telemetry_lanes in ("otlp", "both")
 
     @property
     def root_surfaces(self) -> tuple[str, ...]:
@@ -444,11 +455,29 @@ def _read_intent(config: Config, section: Section | None) -> None:
         config.intent_dir = value.rstrip("/")
 
 
+TELEMETRY_LANES = ("git-only", "otlp", "both")
+# The bullets that only mean something on lane B — they are what an older config used to declare it.
+OTLP_LABELS = ("endpoint", "protocol", "resource attributes", "key variable", "key header", "key repo")
+
+
 def _read_telemetry(config: Config, section: Section | None) -> None:
-    """`## Telemetry` — the OTLP destination and where the auth key is read from. Datadog is one example."""
+    """`## Telemetry` — which lanes are on, the branch the trailer miner reads, and the OTLP destination."""
     if section is None:
         return
+    lanes = _bullet(section, "lanes")
+    if lanes:
+        if lanes.strip().lower() in TELEMETRY_LANES:
+            config.telemetry_lanes = lanes.strip().lower()
+        else:
+            config.notes.append(
+                f"Telemetry › Lanes {lanes!r} is not one of {TELEMETRY_LANES} — using {config.telemetry_lanes}"
+            )
+    elif any(_bullet(section, label) for label in OTLP_LABELS):
+        # No `Lanes` line, but the section names an OTLP destination: that repo configured lane B
+        # before the field existed, and reading it as `git-only` would silently switch its export off.
+        config.telemetry_lanes = "both"
     for attr, labels in (
+        ("default_branch", ("default branch",)),
         ("otel_endpoint", ("endpoint",)),
         ("otel_protocol", ("protocol",)),
         ("otel_resource_attributes", ("resource attributes",)),

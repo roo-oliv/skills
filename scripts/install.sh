@@ -127,19 +127,27 @@ def clone(value):
 
 added = 0
 
-# The OTLP destination is the repo's decision, not this installer's: read it from the config when the
-# target has one. Datadog is one documented example, never a default.
+# Telemetry lane B (OTLP) is opt-in: `## Telemetry` › `Lanes` decides, and a config that names an
+# endpoint or a key variable counts as declaring it. Lane A (the trailers + the load log) needs no env
+# block at all, so a git-only repo gets no OTLP variables written into its settings.
+# When lane B IS on, the destination is the repo's decision, not this installer's: read it from the
+# config. One vendor's header is a documented example there, never a default.
 env_fragment = load("env.json")
+lanes = "git-only"
 try:
     import skills_config
 
     config = skills_config.load(repo)
-    env_block = env_fragment.get("env") or {}
-    env_block["OTEL_EXPORTER_OTLP_ENDPOINT"] = config.otel_endpoint
-    env_block["OTEL_EXPORTER_OTLP_PROTOCOL"] = config.otel_protocol
-    env_block["OTEL_RESOURCE_ATTRIBUTES"] = (
-        config.otel_resource_attributes or "repo=%s" % os.path.basename(os.path.abspath(repo))
-    )
+    lanes = config.telemetry_lanes
+    if not config.otlp_enabled:
+        env_fragment = {}
+    else:
+        env_block = env_fragment.get("env") or {}
+        env_block["OTEL_EXPORTER_OTLP_ENDPOINT"] = config.otel_endpoint
+        env_block["OTEL_EXPORTER_OTLP_PROTOCOL"] = config.otel_protocol
+        env_block["OTEL_RESOURCE_ATTRIBUTES"] = (
+            config.otel_resource_attributes or "repo=%s" % os.path.basename(os.path.abspath(repo))
+        )
 except Exception:  # noqa: BLE001 — a config that cannot be read leaves the fragment's own defaults
     pass
 
@@ -178,6 +186,7 @@ with open(target_path, "w", encoding="utf-8", newline="\n") as handle:
     json.dump(target, handle, indent=2)
     handle.write("\n")
 print("  settings  %d entry(ies) added to %s" % (added, target_path) if added else "  settings  already wired")
+print("  settings  telemetry lane(s): %s%s" % (lanes, "" if lanes != "git-only" else " (no OTLP env block written)"))
 SETTINGS_MERGE
 fi
 

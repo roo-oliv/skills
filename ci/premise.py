@@ -39,6 +39,7 @@ import skills_config  # noqa: E402
 
 ID_FIELD = "**Id:**"
 DEPENDS_FIELD = "**Depends on:**"
+TESTS_FIELD = "**Tests:**"
 ID_RE = re.compile(r"^\*\*Id:\*\* (p-[0-9a-f]{8})\s*$")
 ID_TOKEN_RE = re.compile(r"\bp-[0-9a-f]{8}\b")
 WIKI_RE = re.compile(r"\[\[([^\]]+)\]\]")
@@ -57,6 +58,12 @@ class Section:
     @property
     def text(self) -> str:
         return "\n".join(self.lines)
+
+    @property
+    def has_tests(self) -> bool:
+        """Does the premise carry a `**Tests:**` field? That is the difference between an invariant a
+        test already enforces and one that lives only as prose — `redundant` vs. `decay-candidate`."""
+        return any(line.startswith(TESTS_FIELD) for line in self.lines[1:])
 
 
 def normalise(text: str) -> str:

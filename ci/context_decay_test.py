@@ -168,9 +168,19 @@ class ContextDecayTestCase(unittest.TestCase):
             json.dump(payload, handle)
         return path
 
-    def scan(self, since: int = 90, telemetry: str | None = None, today: dt.date = TODAY):
+    def json_file(self, payload: dict, name: str = "input.json") -> str:
+        """Outside the repo on purpose: a report is an INPUT of the scan, never a surface of it."""
+        outside = tempfile.mkdtemp(prefix="context-decay-input-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        path = os.path.join(outside, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return path
+
+    def scan(self, since: int = 90, telemetry: str | None = None, today: dt.date = TODAY,
+             duplicates: str | None = None):
         self.commit()
-        return context_decay.scan(self.repo, since, telemetry, today)
+        return context_decay.scan(self.repo, since, telemetry, today, duplicates_path=duplicates)
 
     @staticmethod
     def signals(report, label: str) -> list[str]:
@@ -375,6 +385,91 @@ class SignalTest(ContextDecayTestCase):
         )
         report = self.scan()
         self.assertEqual([], report.promotions, self.render(report))
+
+
+    # ── D8 quality / D9 near-duplicate ────────────────────────────────────────────────────────────
+
+    PREMISES = "docs/catalog/premises.md"
+    LOCK_TITLE = "CatalogService writes only under lock"
+    MINOR_TITLE = "A price is stored in minor units"
+
+    def stamp_ids(self) -> None:
+        """The fixture predates `**Id:**`; D8 joins the commit report to the tree BY ID."""
+        text = self.read(self.PREMISES)
+        text = text.replace(f"## {self.LOCK_TITLE}\n", f"## {self.LOCK_TITLE}\n**Id:** `p-11112222`\n")
+        text = text.replace(f"## {self.MINOR_TITLE}\n", f"## {self.MINOR_TITLE}\n**Id:** `p-33334444`\n")
+        self.write(self.PREMISES, text)
+
+    def quality_report(self, premise_class: str, identifier: str = "p-11112222", version: int = 3) -> dict:
+        return {
+            "schema_version": version,
+            "window": {"since": "2020-01-01", "until": "2020-02-01", "sessions": 30},
+            "surfaces": [],
+            "premises": [],
+            "commits": {
+                "premises": [
+                    {"id": identifier, "path": self.PREMISES, "title": self.LOCK_TITLE,
+                     "reads": {"commits": 3}, "violations": {"commits": 2},
+                     "class": premise_class, "action": "rewrite it, or promote it to a gate"}
+                ]
+            },
+        }
+
+    def test_d8_quality_from_v3(self) -> None:
+        self.stamp_ids()
+        label = f"{self.PREMISES} › {self.LOCK_TITLE}"
+        report = self.scan(telemetry=self.json_file(self.quality_report("confusing")))
+        self.assertIn("D8", self.signals(report, label), self.render(report))
+        self.assertIn("confusing (read 3x, violated 2x)", self.render(report))
+        self.assertIn("rewrite it, or promote it to a gate", self.render(report))
+
+        report = self.scan(telemetry=self.json_file(self.quality_report("undiscoverable")))
+        self.assertIn("D8", self.signals(report, label), self.render(report))
+
+        # `working` is a state, not a queue: the classes that are not problems never become candidates.
+        report = self.scan(telemetry=self.json_file(self.quality_report("working")))
+        self.assertEqual([], self.signals(report, label), self.render(report))
+
+    def test_v2_report_has_no_d8(self) -> None:
+        self.stamp_ids()
+        payload = self.quality_report("confusing", version=2)
+        report = self.scan(telemetry=self.json_file(payload))
+        self.assertEqual([], self.signals(report, f"{self.PREMISES} › {self.LOCK_TITLE}"), self.render(report))
+        self.assertIn("D8 not evaluated (schema_version 2", self.render(report))
+
+    def test_d9_near_duplicate_pair(self) -> None:
+        label = f"{self.PREMISES} › {self.LOCK_TITLE}"
+        report = self.scan()  # control: no --duplicates, no D9 anywhere
+        self.assertEqual([], self.signals(report, label), self.render(report))
+        self.assertIn("D9 not evaluated", self.render(report))
+
+        pairs = {"threshold": 0.8, "pairs": [{
+            "ratio": 0.87,
+            "a": {"path": self.PREMISES, "title": self.LOCK_TITLE, "id": None},
+            "b": {"path": self.PREMISES, "title": self.MINOR_TITLE, "id": None},
+        }]}
+        report = self.scan(duplicates=self.json_file(pairs, "dups.json"))
+        self.assertIn("D9", self.signals(report, label), self.render(report))
+        self.assertIn("near-duplicate of docs/catalog/premises.md › A price is stored in minor units (0.87)",
+                      self.render(report))
+        self.assertIn("merge the two into one premise", self.render(report))
+        # One candidate per pair, on the first of the two — the decision is taken once.
+        self.assertEqual([], self.signals(report, f"{self.PREMISES} › {self.MINOR_TITLE}"), self.render(report))
+
+    def test_d9_valid_report_with_zero_pairs_is_evaluated_not_absent(self) -> None:
+        """Zero pairs is the plausible (and desirable) outcome for today's tree. Saying "not evaluated"
+        next to `duplicates: <file>` in the summary would be the output contradicting itself."""
+        path = self.json_file({"threshold": 0.8, "pairs": []}, "dups.json")
+        rendered = self.render(self.scan(duplicates=path))
+        self.assertNotIn("D9 not evaluated", rendered)
+        self.assertIn(f"duplicates: {path}", rendered)
+
+    def test_d9_pair_naming_a_premise_the_tree_lost_is_ignored(self) -> None:
+        pairs = {"pairs": [{"ratio": 0.9,
+                            "a": {"path": self.PREMISES, "title": "Gone since the report", "id": None},
+                            "b": {"path": self.PREMISES, "title": self.MINOR_TITLE, "id": None}}]}
+        report = self.scan(duplicates=self.json_file(pairs, "dups.json"))
+        self.assertEqual([], report.candidates, self.render(report))
 
 
 class IntentTest(ContextDecayTestCase):

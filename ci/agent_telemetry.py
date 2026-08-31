@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Log WHICH instruction surfaces a Claude Code session loaded, and report on the window.
 
-Two subcommands, one file:
+Three subcommands, one file:
 
   hook    reads a hook payload on stdin and appends ONE json line to .claude/telemetry/loads-<UTC date>.jsonl.
           Wired to InstructionsLoaded (every load_reason) and to PostToolUse on Read|Skill|Bash in
@@ -11,6 +11,12 @@ Two subcommands, one file:
   report  aggregates those files over a window: loads, distinct sessions, session share, bytes on disk,
           bytes loaded, reasons, last load, and a decay/demotion verdict — plus, for premises files, the
           same count PER PREMISE, and a histogram of distinct sessions per effort level.
+
+  commits mines the `Premises-Read`/`Premises-Files-Read`/`Premises-Violated`/`Agent-Session` trailers the
+          commit gate writes into every commit made inside an agent session, and crosses the two axes —
+          READ and VIOLATED — into one class per premise (schema_version 3). The log of `report` is per
+          machine and never leaves the disk that wrote it; a trailer rides the commit through the squash
+          into the default branch, so this is the axis that aggregates across people and machines.
 
 Line format (one per load, all thirteen keys always present):
 
@@ -31,9 +37,10 @@ fetched through the configured premise fetch command in a Bash call (`read` bein
     echo '<payload>' | python3 .github/scripts/agent_telemetry.py hook
     python3 .github/scripts/agent_telemetry.py report --since 2026-08-20 .claude/telemetry
     python3 .github/scripts/agent_telemetry.py report --format json ~/work/*/.claude/telemetry
+    python3 .github/scripts/agent_telemetry.py commits --prs open --format json
 
-The JSON output (`schema_version` 2) is the contract `context_decay.py --telemetry` reads to decide what
-decayed. Nothing here is stack-specific: which paths are surfaces, where premises live and how a premise
+The JSON output of `report` (`schema_version` 2) and of `commits --format json` (3, a superset) is the
+contract `context_decay.py --telemetry` reads to decide what decayed. Nothing here is stack-specific: which paths are surfaces, where premises live and how a premise
 is fetched all come from `docs/agents/skills-config.md` (see `skills_config.py`). Python 3 stdlib only,
 3.9-compatible — CI may have 3.12 but the machines emitting these logs may not.
 """
@@ -43,8 +50,10 @@ from __future__ import annotations
 import argparse
 import datetime
 import glob
+import itertools
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -67,6 +76,49 @@ EFFORT_ENV = "CLAUDE_EFFORT"
 EFFORT_UNKNOWN = "unknown"
 INTERPRETERS = ("python", "python3", "node", "ruby", "perl", "bash", "sh")
 SHELL_OPERATORS = ("&&", "||", "|", ";", "&", ">", ">>", "<")
+
+# ── commit trailers: the store that survives the squash ───────────────────────────────────────────
+# A squash-merge CONCATENATES the messages of every commit of the PR, so the trailers of each original
+# commit land in the MIDDLE of the body of the commit on the default branch. That is why nothing here
+# goes through `git interpret-trailers`: it only reads the last paragraph, and the last paragraph of a
+# squash is the merge's own `Co-authored-by:`. The regex reads the whole body instead.
+SESSION_TRAILER = "Agent-Session"
+READ_TRAILER = "Premises-Read"
+FILES_TRAILER = "Premises-Files-Read"
+VIOLATED_TRAILER = "Premises-Violated"
+TRAILER_RE = re.compile(r"^(Premises-Read|Premises-Files-Read|Premises-Violated|Agent-Session): (.+)$")
+# Any `Key: value` line keeps the run going, so the `Co-Authored-By:` lines git already writes between
+# our trailers do not split one commit's block in two.
+ANY_TRAILER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*: .+$")
+COMMITS_SCHEMA_VERSION = 3
+DEFAULT_COMMITS_WINDOW_DAYS = 90
+GH_PR_LIMIT = 200
+
+# Classification is COUNTING, not judgement — the two axes are read (`Premises-Read`) and violated
+# (`Premises-Violated`), both written by scripts, never by the model. Thresholds live here so the
+# report can name them; `confusing` needs TWO violations because one is an accident and two a pattern.
+CONFUSING_MIN_VIOLATIONS = 2
+# Below this many annotated commits, "nobody read it" says more about the window than about the premise
+# — the same floor `MIN_SESSIONS_FOR_LOW_LOAD` puts under the load report. Silence stays `unclassified`;
+# a premise that WAS read or violated is classified on its own evidence, however thin the window.
+MIN_COMMITS_FOR_SILENCE = 20
+WORKING = "working"
+WATCH = "watch"
+CONFUSING = "confusing"
+UNDISCOVERABLE = "undiscoverable"
+REDUNDANT = "redundant"
+DECAY_CANDIDATE = "decay-candidate"
+UNCLASSIFIED = "unclassified"
+CLASS_ORDER = (CONFUSING, UNDISCOVERABLE, WATCH, WORKING, REDUNDANT, DECAY_CANDIDATE, UNCLASSIFIED)
+CLASS_ACTION = {
+    CONFUSING: "rewrite it, or promote it to a gate",
+    UNDISCOVERABLE: "a discovery problem: the title in the index, the hook's term mapping",
+    WATCH: "watch: one violation with a read — rewrite if it repeats",
+    WORKING: "keep",
+    REDUNDANT: "gated by a test and almost never read — trim the prose",
+    DECAY_CANDIDATE: "never read and no `**Tests:**` — a decay candidate",
+    UNCLASSIFIED: "too few annotated commits in the window — nothing to conclude",
+}
 
 INSTRUCTIONS = "instructions"
 README = "readme"
@@ -245,10 +297,12 @@ def build_record(payload: dict, root: str, config: skills_config.Config, now: da
 
 
 def premise_sections(path: str, relative: str) -> tuple:
-    """`([(title, start, end, id)], total_lines)`, 1-based with `end` exclusive; `id` may be None.
+    """`([(title, start, end, id, has_tests)], total_lines)`, 1-based with `end` exclusive.
 
     Parsed by `premise.parse_sections` — the same H2 rule `context_lint.collect_premises` uses — so a
-    title logged here is the title the linter and the generated index use.
+    title logged here is the title the linter and the generated index use. `id` may be None;
+    `has_tests` is whether the section carries a `**Tests:**` field, which is what tells `redundant`
+    from `decay-candidate` in the commit report.
     """
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
@@ -256,7 +310,7 @@ def premise_sections(path: str, relative: str) -> tuple:
     except OSError:
         return [], 0
     sections = [
-        (section.title, section.start, section.start + len(section.lines), section.id)
+        (section.title, section.start, section.start + len(section.lines), section.id, section.has_tests)
         for section in premise.parse_sections(relative, content)
     ]
     return sections, len(content.split("\n"))
@@ -315,7 +369,7 @@ def resolve_premise_ids(repo: str, config: skills_config.Config, ids: list) -> d
     wanted = set(ids)
     for relative in premise.premises_files(repo, config):
         sections, _ = premise_sections(os.path.join(repo, relative), relative)
-        for title, _start, _end, premise_id in sections:
+        for title, _start, _end, premise_id, _has_tests in sections:
             if premise_id in wanted:
                 found[premise_id] = (relative, title)
                 wanted.discard(premise_id)
@@ -374,7 +428,7 @@ def premise_records(base: dict, payload: dict, root: str) -> list:
     end = start + limit if limit is not None else total_lines + 1
 
     records = []
-    for title, section_start, section_end, premise_id in sections:
+    for title, section_start, section_end, premise_id, _has_tests in sections:
         # Half-open intervals: the section is read when it overlaps [start, end).
         if whole or (section_start < end and section_end > start):
             record = dict(base)
@@ -510,12 +564,12 @@ def candidate_for(kind: str, loads: int, session_share: float, sessions_total: i
 
 
 def premises_universe(repo: str, config: skills_config.Config) -> list:
-    """Every premise title of every premises file in the tree, as `(path, title, id)`."""
+    """Every premise of every premises file in the tree, as `(path, title, id, has_tests)`."""
     universe = []
     for relative in premise.premises_files(repo, config):
         sections, _ = premise_sections(os.path.join(repo, relative), relative)
-        for title, _start, _end, premise_id in sections:
-            universe.append((relative, title, premise_id))
+        for title, _start, _end, premise_id, has_tests in sections:
+            universe.append((relative, title, premise_id, has_tests))
     return universe
 
 
@@ -533,7 +587,7 @@ def aggregate_premises(records: list, universe: list, sessions_total: int) -> li
             current["id"] = premise_id
         return current
 
-    for path, title, premise_id in universe:
+    for path, title, premise_id, _has_tests in universe:
         row((path, title), premise_id)
     for record in records:
         if not record.get("read"):
@@ -755,6 +809,9 @@ def render_markdown(report: dict) -> str:
             )
     else:
         lines.append("None.")
+    # A v3 document carries both axes; the matrix is appended so one `--format md` reads as one report.
+    if report.get("commits"):
+        return "\n".join(lines) + "\n\n" + render_commits(report["commits"])
     return "\n".join(lines) + "\n"
 
 
@@ -769,6 +826,434 @@ def cmd_report(args: argparse.Namespace, stdout) -> int:
         stdout.write(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
     else:
         stdout.write(render_markdown(report))
+    return 0
+
+
+# ── commits: mining the trailers ──────────────────────────────────────────────────────────────────
+
+
+def trailer_blocks(body: str) -> list:
+    """One dict per ORIGINAL commit inside `body` — `{trailer: value}` for the four keys we write.
+
+    A block is a run of consecutive trailer-shaped lines: a squash body carries one run per commit of
+    the PR, which is what makes "one `Agent-Session` block = one original commit" true after the merge.
+    Lines like `Co-Authored-By:` keep the run going (git writes ours after them, in the same paragraph);
+    a repeated key starts a new block, so two runs glued by a stray `Key: value` line still count twice.
+    Blocks without `Agent-Session` are dropped: a commit made outside a session is not this population.
+    """
+    blocks: list = []
+    current: dict | None = None
+    for raw in body.split("\n"):
+        line = raw.rstrip()
+        if not ANY_TRAILER_RE.match(line):
+            current = None
+            continue
+        match = TRAILER_RE.match(line)
+        if match is None:
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        if current is None or key in current:
+            current = {}
+            blocks.append(current)
+        current[key] = value
+    return [block for block in blocks if block.get(SESSION_TRAILER)]
+
+
+def trailer_values(block: dict, key: str) -> list:
+    """The comma-separated list of one trailer, de-duplicated, order preserved."""
+    values: list = []
+    for item in (block.get(key) or "").split(","):
+        item = item.strip()
+        if item and item not in values:
+            values.append(item)
+    return values
+
+
+def premise_ids(block: dict, key: str) -> list:
+    """Only well-formed ids count — the same filter the fetch-command path applies to a Bash command."""
+    return [value for value in trailer_values(block, key) if premise.ID_TOKEN_RE.fullmatch(value)]
+
+
+def commit_record(block: dict, author: str, date: str, origin: str) -> dict:
+    return {
+        "session": block.get(SESSION_TRAILER) or "",
+        "read": premise_ids(block, READ_TRAILER),
+        "files": trailer_values(block, FILES_TRAILER),
+        "violated": premise_ids(block, VIOLATED_TRAILER),
+        "author": author or "",
+        "date": (date or "")[:10],
+        "origin": origin,
+    }
+
+
+def dedupe_key(record: dict) -> tuple:
+    """What identifies an original commit ACROSS sources: a squash body keeps the trailers, not the sha."""
+    return (record["session"], tuple(record["read"]), tuple(record["files"]), tuple(record["violated"]))
+
+
+def git_output(repo: str, *args: str) -> str:
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False
+        ).stdout.decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def resolve_branch(repo: str, branch: str) -> str | None:
+    """`<branch>` in a clone; `origin/<branch>` in a worktree that never checked it out."""
+    for candidate in (branch, "origin/" + branch):
+        if git_output(repo, "rev-parse", "--verify", "--quiet", candidate + "^{commit}").strip():
+            return candidate
+    return None
+
+
+GIT_LOG_FORMAT = "%H%x00%an%x00%cs%x00%B%x00"
+
+
+def branch_blocks(repo: str, branch: str, since: datetime.date, until: datetime.date) -> tuple:
+    """`(commits scanned, records, note)` from the branch log — squash bodies and plain commits alike."""
+    ref = resolve_branch(repo, branch)
+    if ref is None:
+        return 0, [], "ref `%s` does not exist" % branch
+    out = git_output(
+        repo,
+        "log",
+        "--format=" + GIT_LOG_FORMAT,
+        "--since=" + since.isoformat(),
+        "--until=" + until.isoformat() + " 23:59:59",
+        ref,
+    )
+    fields = out.split("\0")
+    commits = 0
+    records: list = []
+    for index in range(0, len(fields) - 3, 4):
+        sha = fields[index].strip()
+        if not sha:
+            continue
+        commits += 1
+        for block in trailer_blocks(fields[index + 3]):
+            records.append(commit_record(block, fields[index + 1], fields[index + 2], "%s:%s" % (ref, sha[:12])))
+    return commits, records, None
+
+
+def gh_json(repo: str, args: list):
+    """`(payload, note)` — `gh` missing, failing or babbling is a NOTE, never an exception."""
+    try:
+        proc = subprocess.run(["gh"] + args, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              check=False)
+    except OSError:
+        return None, "`gh` is not on the PATH"
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip().split("\n")[0]
+        return None, "`gh %s` failed: %s" % (" ".join(args[:2]), detail or "exit %d" % proc.returncode)
+    try:
+        return json.loads(proc.stdout.decode("utf-8", "replace") or "null"), None
+    except ValueError:
+        return None, "`gh %s` returned unreadable json" % " ".join(args[:2])
+
+
+def pr_blocks(repo: str, state: str) -> tuple:
+    """`(commits scanned, records, note)` from the commits of the PRs `gh` lists.
+
+    `open` by default and on purpose: a merged PR is already a squash body on the branch, so asking for
+    `all` counts every premise it read twice. `gh` missing or unauthenticated is a NOTE, never a failure —
+    the branch source alone is a valid, smaller answer.
+
+    The numbers come first and each PR is then asked for its own commits: `pr list --json commits` over
+    N PRs asks GitHub for `N x commits x authors` nodes in ONE GraphQL query and is rejected above
+    500 000 — which is what the first live run against a production repository hit at `--limit 200`,
+    silently zeroing the whole source.
+    """
+    listed, note = gh_json(repo, ["pr", "list", "--state", state, "--limit", str(GH_PR_LIMIT), "--json", "number"])
+    if listed is None:
+        return 0, [], note
+    commits = 0
+    records: list = []
+    notes = []
+    for pull in listed if isinstance(listed, list) else []:
+        number = pull.get("number")
+        if number is None:
+            continue
+        detail, note = gh_json(repo, ["pr", "view", str(number), "--json", "commits"])
+        if detail is None:
+            notes.append("#%s: %s" % (number, note))
+            continue
+        for commit in (detail.get("commits") or []):
+            commits += 1
+            body = "\n\n".join(part for part in (commit.get("messageHeadline"), commit.get("messageBody")) if part)
+            authors = [author.get("name") or author.get("login") or "" for author in (commit.get("authors") or [])]
+            origin = "pr#%s:%s" % (number, (commit.get("oid") or "")[:12])
+            for block in trailer_blocks(body):
+                records.append(commit_record(block, ", ".join(a for a in authors if a),
+                                             commit.get("committedDate") or "", origin))
+    return commits, records, "; ".join(notes) or None
+
+
+def later(current: str | None, candidate: str) -> str | None:
+    if not candidate:
+        return current
+    return candidate if current is None or candidate > current else current
+
+
+def classify(reads: int, violations: int, has_tests: bool, annotated: int) -> str:
+    """Counting, in this order — the first cell that matches wins.
+
+    `confusing` needs two violations: one is an accident, two is a pattern. The cell an earlier draft
+    left empty — read AND violated once — is `watch`: below the threshold, but not `working`, which
+    means "never violated". Naming it keeps the matrix without an unresolved cell. `annotated` is how
+    many commits of the window carried trailers at all: under the floor, silence is `unclassified`.
+    """
+    if violations >= CONFUSING_MIN_VIOLATIONS and reads >= 1:
+        return CONFUSING
+    if violations >= 1 and reads == 0:
+        return UNDISCOVERABLE
+    if violations >= 1:
+        return WATCH
+    if reads >= 1:
+        return WORKING
+    if annotated < MIN_COMMITS_FOR_SILENCE:
+        return UNCLASSIFIED
+    return REDUNDANT if has_tests else DECAY_CANDIDATE
+
+
+def aggregate_commits(records: list, universe: list) -> dict:
+    """One row per premise of the tree (plus every id a trailer names that the tree no longer carries)."""
+    annotated = len(records)
+    known = {
+        premise_id: (path, title, has_tests)
+        for path, title, premise_id, has_tests in universe
+        if premise_id
+    }
+    rows: dict = {}
+
+    def row(premise_id: str) -> dict:
+        if premise_id not in rows:
+            path, title, has_tests = known.get(premise_id, (None, None, False))
+            rows[premise_id] = {
+                "id": premise_id,
+                "path": path,
+                "title": title,
+                "has_tests": has_tests,
+                "reads": {"commits": 0, "sessions": set(), "authors": set(), "last": None},
+                "violations": {"commits": 0, "last": None},
+            }
+        return rows[premise_id]
+
+    for premise_id in known:
+        row(premise_id)
+
+    pairs: dict = {}
+    files: dict = {}
+    for record in records:
+        for premise_id in record["read"]:
+            reads = row(premise_id)["reads"]
+            reads["commits"] += 1
+            if record["session"]:
+                reads["sessions"].add(record["session"])
+            if record["author"]:
+                reads["authors"].add(record["author"])
+            reads["last"] = later(reads["last"], record["date"])
+        for premise_id in record["violated"]:
+            violations = row(premise_id)["violations"]
+            violations["commits"] += 1
+            violations["last"] = later(violations["last"], record["date"])
+        for path in record["files"]:
+            files[path] = files.get(path, 0) + 1
+        for pair in itertools.combinations(sorted(set(record["read"])), 2):
+            pairs[pair] = pairs.get(pair, 0) + 1
+
+    premises = []
+    for premise_id in sorted(rows):
+        current = rows[premise_id]
+        reads, violations = current["reads"], current["violations"]
+        premise_class = classify(reads["commits"], violations["commits"], current["has_tests"], annotated)
+        premises.append(
+            {
+                "id": premise_id,
+                "path": current["path"],
+                "title": current["title"],
+                "has_tests": current["has_tests"],
+                "reads": {
+                    "commits": reads["commits"],
+                    "sessions": len(reads["sessions"]),
+                    "authors": len(reads["authors"]),
+                    "last": reads["last"],
+                },
+                "violations": {"commits": violations["commits"], "last": violations["last"]},
+                "class": premise_class,
+                "action": CLASS_ACTION[premise_class],
+            }
+        )
+    premises.sort(
+        key=lambda item: (
+            CLASS_ORDER.index(item["class"]),
+            -item["violations"]["commits"],
+            -item["reads"]["commits"],
+            item["path"] or "",
+            item["title"] or "",
+        )
+    )
+
+    titles = {premise_id: value[1] for premise_id, value in known.items()}
+    co_read = [
+        {"ids": list(pair), "titles": [titles.get(pair[0]), titles.get(pair[1])], "commits": count}
+        for pair, count in sorted(pairs.items(), key=lambda item: (-item[1], item[0]))
+        if count >= 2
+    ]
+    classes = {name: 0 for name in CLASS_ORDER}
+    for item in premises:
+        classes[item["class"]] += 1
+    return {
+        "premises": premises,
+        "co_read_pairs": co_read,
+        "files": [{"path": path, "commits": count} for path, count in sorted(files.items())],
+        "classes": classes,
+    }
+
+
+def build_commits(repo: str, branch: str, since: datetime.date, until: datetime.date, prs: str,
+                  universe: list | None = None, config: skills_config.Config | None = None) -> dict:
+    sources: list = []
+    records: list = []
+    seen: set = set()
+
+    commits, found, note = branch_blocks(repo, branch, since, until)
+    sources.append({"source": "branch", "ref": branch, "commits": commits, "blocks": len(found), "note": note})
+    for record in found:
+        seen.add(dedupe_key(record))
+        records.append(record)
+
+    if prs != "none":
+        commits, found, note = pr_blocks(repo, prs)
+        duplicates = 0
+        for record in found:
+            # ACROSS sources only. Two commits of the same session that read no premise carry the very
+            # same trailer block, so adding PR keys to `seen` would collapse them into one — which is
+            # what the first live run did to its first two annotated commits.
+            if dedupe_key(record) in seen:
+                duplicates += 1
+                continue
+            records.append(record)
+        sources.append({"source": "prs", "state": prs, "commits": commits, "blocks": len(found),
+                        "duplicates_skipped": duplicates, "note": note})
+
+    if universe is None:
+        universe = premises_universe(repo, config or skills_config.load(repo))
+    aggregated = aggregate_commits(records, universe)
+    aggregated["window"] = {"since": since.isoformat(), "until": until.isoformat(), "branch": branch, "prs": prs}
+    aggregated["sources"] = sources
+    aggregated["totals"] = {
+        "commits": len(records),
+        "sessions": len({r["session"] for r in records if r["session"]}),
+        "authors": len({r["author"] for r in records if r["author"]}),
+        "violations": sum(len(r["violated"]) for r in records),
+        "confusing_min_violations": CONFUSING_MIN_VIOLATIONS,
+        "min_commits_for_silence": MIN_COMMITS_FOR_SILENCE,
+    }
+    return aggregated
+
+
+def commits_document(commits: dict, report_path: str | None) -> dict:
+    """The v3 document: a v2 report with `commits` bolted on.
+
+    Without `--report` the v2 half is EMPTY — this source carries no load telemetry, and an empty
+    `surfaces[]` says exactly that to a v2 consumer (it evaluates D3 on nothing instead of on a lie).
+    With it, the same file answers both axes and the decay scan needs a single `--telemetry`.
+    """
+    window = commits["window"]
+    document = {
+        "schema_version": COMMITS_SCHEMA_VERSION,
+        "window": {"since": window["since"], "until": window["until"], "sessions": 0,
+                   "sessions_by_effort": {}, "loads": 0, "dirs": []},
+        "surfaces": [],
+        "premises": [],
+        "candidates": [],
+    }
+    if report_path:
+        with open(report_path, encoding="utf-8") as handle:
+            base = json.load(handle)
+        if base.get("schema_version") not in (1, SCHEMA_VERSION):
+            raise SystemExit("agent-telemetry: --report has schema_version %r, outside (1, 2)"
+                             % base.get("schema_version"))
+        document = dict(base)
+        document["schema_version"] = COMMITS_SCHEMA_VERSION
+    document["commits"] = commits
+    return document
+
+
+def premise_label(item: dict) -> str:
+    if item["title"]:
+        return "`%s` › %s" % (item["path"], item["title"])
+    return "(an id with no premise in the tree)"
+
+
+def render_commits(commits: dict) -> str:
+    window, totals = commits["window"], commits["totals"]
+    lines = [
+        "# Premise quality — read x violated",
+        "",
+        "Window `%s..%s` on `%s` (PRs: %s) — %d commit(s) with a trailer, %d session(s), %d author(s), "
+        "%d violation(s)."
+        % (window["since"], window["until"], window["branch"], window["prs"], totals["commits"],
+           totals["sessions"], totals["authors"], totals["violations"]),
+    ]
+    for source in commits["sources"]:
+        lines.append(
+            "- source `%s` (%s): %d commit(s) read, %d block(s)%s%s"
+            % (
+                source["source"],
+                source.get("ref") or source.get("state") or "—",
+                source["commits"],
+                source["blocks"],
+                ", %d duplicate(s) skipped" % source["duplicates_skipped"]
+                if source.get("duplicates_skipped") else "",
+                " — %s" % source["note"] if source.get("note") else "",
+            )
+        )
+    lines += ["", "| class | premises | action |", "|---|---:|---|"]
+    for name in CLASS_ORDER:
+        lines.append("| %s | %d | %s |" % (name, commits["classes"][name], CLASS_ACTION[name]))
+
+    lines += ["", "## Confusing and undiscoverable", ""]
+    flagged = [item for item in commits["premises"] if item["class"] in (CONFUSING, UNDISCOVERABLE, WATCH)]
+    if flagged:
+        lines += ["| id | premise | read | violated | class | action |", "|---|---|---:|---:|---|---|"]
+        for item in flagged:
+            lines.append(
+                "| `%s` | %s | %d | %d | %s | %s |"
+                % (item["id"], premise_label(item), item["reads"]["commits"], item["violations"]["commits"],
+                   item["class"], item["action"])
+            )
+    else:
+        lines.append("None.")
+
+    lines += ["", "## Co-read pairs (>= 2 commits)", ""]
+    if commits["co_read_pairs"]:
+        lines += ["| a | b | commits |", "|---|---|---:|"]
+        for pair in commits["co_read_pairs"]:
+            lines.append(
+                "| `%s` %s | `%s` %s | %d |"
+                % (pair["ids"][0], pair["titles"][0] or "—", pair["ids"][1], pair["titles"][1] or "—",
+                   pair["commits"])
+            )
+    else:
+        lines.append("None.")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_commits(args: argparse.Namespace, stdout) -> int:
+    until = parse_date(args.until) if args.until else datetime.datetime.now(datetime.timezone.utc).date()
+    since = (parse_date(args.since) if args.since
+             else until - datetime.timedelta(days=DEFAULT_COMMITS_WINDOW_DAYS - 1))
+    repo = os.path.abspath(args.repo)
+    config = skills_config.load(repo, args.config)
+    commits = build_commits(repo, args.branch or config.default_branch, since, until, args.prs, config=config)
+    if args.format == "json":
+        document = commits_document(commits, args.report)
+        stdout.write(json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    else:
+        stdout.write(render_commits(commits))
     return 0
 
 
@@ -790,9 +1275,36 @@ def main(argv: list) -> int:
         "--config", default=None, help="path to the config (default: <repo>/%s)" % skills_config.CONFIG_PATH
     )
 
+    commits = sub.add_parser("commits", help="mine the premise trailers of the branch log and the open PRs")
+    commits.add_argument("--since", help="first day of the window, YYYY-MM-DD (default: until - 89 days)")
+    commits.add_argument("--until", help="last day of the window, YYYY-MM-DD (default: today, UTC)")
+    commits.add_argument(
+        "--branch",
+        default=None,
+        help="branch to read (default: config › Telemetry › Default branch, then origin/<it>)",
+    )
+    commits.add_argument(
+        "--prs",
+        choices=("none", "open", "all"),
+        default="open",
+        help="which PRs `gh` adds to the branch log (default: open — `all` double-counts merged ones)",
+    )
+    commits.add_argument("--format", choices=("md", "json"), default="md", help="output format (default: md)")
+    commits.add_argument("--repo", default=skills_config.default_repo(), help="repository root")
+    commits.add_argument(
+        "--config", default=None, help="path to the config (default: <repo>/%s)" % skills_config.CONFIG_PATH
+    )
+    commits.add_argument(
+        "--report",
+        default=None,
+        help="a `report --format json` file to merge into the v3 document, so one file answers both axes",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "hook":
         return cmd_hook(sys.stdin)
+    if args.command == "commits":
+        return cmd_commits(args, sys.stdout)
     return cmd_report(args, sys.stdout)
 
 

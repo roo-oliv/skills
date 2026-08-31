@@ -95,10 +95,28 @@ skills repo (docs/context-toolkit.md there — it is not a file of this repo).
 
 ## Telemetry
 
-Optional — read by `otel_headers.py` and by `scripts/install.sh` when it merges the `env` block into
-`.claude/settings.json`. **Datadog is the one example measured**, not a default: any OTLP intake works.
+Two independent lanes, and **lane A is the default** because it needs no vendor at all:
+
+- **lane A — git-only:** the commit gate writes `Premises-Read` / `Premises-Violated` / `Agent-Session`
+  trailers into every commit made in an agent session, and `agent_telemetry.py commits` mines them out of
+  the branch log and the open PRs. It answers *was this premise used, and violated anyway* across every
+  person and machine, with nothing but `git` and `gh`. It does **not** measure tokens or dollars.
+- **lane B — otlp:** the `env` block `scripts/install.sh` merges into `.claude/settings.json` plus
+  `otel_headers.py`, exporting cost and token counts per model / skill / agent to an OTLP intake. It does
+  **not** know anything about premises.
+
 Full setup, attributes and example queries: the telemetry doc of the skills repo (docs/telemetry.md there
 — it is not a file of this repo).
+
+- **Lanes:** `<git-only | otlp | both>`
+  <!-- default: git-only. A section that names an Endpoint or a Key variable but no Lanes counts as
+       `both`, so a repo configured before this field existed keeps its export. `git-only` writes NO OTLP
+       variables into .claude/settings.json. -->
+- **Default branch:** `<branch>`
+  <!-- default: main — the branch `agent_telemetry.py commits` mines (it falls back to origin/<branch>) -->
+
+The rows below matter only on `otlp`/`both`. **One vendor is the single example measured**, never a
+default: any OTLP intake works.
 
 - **Endpoint:** `<url>`  <!-- default: http://localhost:4318 (a collector or vendor agent on the machine) -->
 - **Protocol:** `<http/protobuf | http/json>`

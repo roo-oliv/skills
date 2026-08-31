@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -509,6 +510,414 @@ class CheckoutResolution(Harness):
         self.run_hook(self.instructions(os.path.join(self.repo, "CLAUDE.md"), plain))
         self.assertEqual(1, len(self.logs_in(self.repo)))
         self.assertEqual([], self.logs_in(plain))
+
+
+# ── commits: the trailers, mined ──────────────────────────────────────────────────────────────────
+
+# A SYNTHETIC body in the exact shape a squash-merge produces: N commit messages concatenated under one
+# subject, each original commit's own `Co-Authored-By:` trailer paragraph in the MIDDLE of the body, and
+# the merge's `Co-authored-by:` as the last paragraph — the only paragraph `git interpret-trailers`
+# would ever look at, which is why the miner never uses it.
+PLAIN_SQUASH_BODY = """feat(catalog): reserve stock before charging (#412)
+
+* feat(catalog): reserve stock before charging
+
+The reservation is written under the row lock, so a second checkout of the
+same sku cannot read a stale quantity.
+
+Co-Authored-By: Assistant <noreply@example.com>
+
+* fix(catalog): the reservation expires with the cart, not with the session
+
+Co-Authored-By: Assistant <noreply@example.com>
+Some-Other-Trailer: an unrelated key git already writes
+
+* test(shipping): a shipment is never re-dispatched
+
+Co-Authored-By: Assistant <noreply@example.com>
+
+---------
+
+Co-authored-by: Assistant <noreply@example.com>
+"""
+
+# The same body once the commit gate is on: the trailers are appended to the trailer paragraph of each
+# ORIGINAL commit, exactly where `git commit --trailer` puts them.
+SQUASH_BODY = (
+    PLAIN_SQUASH_BODY.replace(
+        "Co-Authored-By: Assistant <noreply@example.com>\n\n* fix(catalog)",
+        "Co-Authored-By: Assistant <noreply@example.com>\n"
+        "Premises-Read: p-1a2b3c4d\n"
+        "Agent-Session: session-alpha\n\n* fix(catalog)",
+    )
+    .replace(
+        "Some-Other-Trailer: an unrelated key git already writes\n\n* test(shipping)",
+        "Some-Other-Trailer: an unrelated key git already writes\n"
+        "Premises-Read: p-1a2b3c4d, p-99887766\n"
+        "Premises-Files-Read: docs/shipping/premises.md\n"
+        "Agent-Session: session-alpha\n\n* test(shipping)",
+    )
+    .replace(
+        "Co-Authored-By: Assistant <noreply@example.com>\n\n---------",
+        "Co-Authored-By: Assistant <noreply@example.com>\n"
+        "Premises-Read: p-99887766\n"
+        "Premises-Violated: p-99887766\n"
+        "Agent-Session: session-beta\n\n---------",
+    )
+)
+
+UNIVERSE = [
+    ("docs/catalog/premises.md", "Indexed premise", "p-1a2b3c4d", True),
+    ("docs/catalog/premises.md", "Another indexed premise", "p-99887766", False),
+    ("docs/shipping/premises.md", "First premise", "p-cafed00d", True),
+    ("docs/shipping/premises.md", "Second premise", "p-beefbeef", False),
+]
+
+# A window wide enough to hold any fixture commit. Not year 2100: git's date parser is bounded by
+# time_t, and `--until=2100-01-01` silently matches NOTHING (found by this very test).
+WIDE_SINCE = datetime.date(2000, 1, 1)
+WIDE_UNTIL = datetime.date(2030, 1, 1)
+
+
+def block(session: str, read: str = "", violated: str = "", files: str = "",
+          author: str = "Fixture", date: str = "2026-08-28") -> dict:
+    return {"session": session, "read": [i for i in read.split() if i], "files": [f for f in files.split() if f],
+            "violated": [i for i in violated.split() if i], "author": author, "date": date, "origin": "test"}
+
+
+class TrailerParsing(unittest.TestCase):
+    def test_a_squash_body_without_the_gate_has_no_block(self) -> None:
+        # The honest baseline: a repository that predates the trailers mines nothing. Positive control
+        # that the parser is not simply blind — the annotated copy below finds three.
+        self.assertEqual([], agent_telemetry.trailer_blocks(PLAIN_SQUASH_BODY))
+
+    def test_one_block_per_original_commit_in_the_middle_of_a_squash(self) -> None:
+        blocks = agent_telemetry.trailer_blocks(SQUASH_BODY)
+        self.assertEqual(3, len(blocks))
+        self.assertEqual(["session-alpha", "session-alpha", "session-beta"],
+                         [b["Agent-Session"] for b in blocks])
+        self.assertEqual("p-1a2b3c4d, p-99887766", blocks[1]["Premises-Read"])
+        self.assertEqual("docs/shipping/premises.md", blocks[1]["Premises-Files-Read"])
+        self.assertEqual("p-99887766", blocks[2]["Premises-Violated"])
+
+    def test_the_trailers_are_not_in_the_last_paragraph(self) -> None:
+        """Why `git interpret-trailers` is banned: it reads the last paragraph, and the last paragraph
+        of a squash belongs to the MERGE, not to any of the commits that carried a session."""
+        last_paragraph = SQUASH_BODY.strip().split("\n\n")[-1]
+        self.assertIn("Co-authored-by:", last_paragraph)
+        for key in ("Agent-Session", "Premises-Read", "Premises-Violated"):
+            self.assertNotIn(key, last_paragraph)
+
+    def test_a_block_without_agent_session_is_not_a_commit_of_the_population(self) -> None:
+        self.assertEqual([], agent_telemetry.trailer_blocks("subject\n\nPremises-Read: p-1a2b3c4d\n"))
+
+    def test_values_are_split_deduplicated_and_ordered_as_written(self) -> None:
+        blocks = agent_telemetry.trailer_blocks(
+            "subject\n\nPremises-Read: p-1a2b3c4d,  p-99887766 , p-1a2b3c4d\nAgent-Session: s1\n"
+        )
+        self.assertEqual(["p-1a2b3c4d", "p-99887766"],
+                         agent_telemetry.trailer_values(blocks[0], "Premises-Read"))
+
+    def test_only_well_formed_ids_reach_the_premise_axis(self) -> None:
+        blocks = agent_telemetry.trailer_blocks(
+            "subject\n\nPremises-Read: p-1a2b3c4d, junk, p-XYZ\nAgent-Session: s1\n"
+        )
+        record = agent_telemetry.commit_record(blocks[0], "Fixture", "2026-08-28", "test")
+        self.assertEqual(["p-1a2b3c4d"], record["read"])
+
+    def test_two_runs_glued_by_a_stray_key_line_still_count_twice(self) -> None:
+        body = "subject\n\nAgent-Session: s1\nNote: just a line with a colon\nAgent-Session: s2\n"
+        self.assertEqual(["s1", "s2"], [b["Agent-Session"] for b in agent_telemetry.trailer_blocks(body)])
+
+
+class Classification(unittest.TestCase):
+    FLOOR = agent_telemetry.MIN_COMMITS_FOR_SILENCE
+
+    def rows(self, records: list) -> dict:
+        aggregated = agent_telemetry.aggregate_commits(records, UNIVERSE)
+        return {item["id"]: item for item in aggregated["premises"]}
+
+    def padding(self, count: int) -> list:
+        """Annotated commits that touch no premise of the universe — they only fill the window."""
+        return [block("s-pad-%d" % index, read="p-nobody") for index in range(count)]
+
+    def test_read_and_never_violated_is_working(self) -> None:
+        rows = self.rows([block("s1", read="p-1a2b3c4d")])
+        self.assertEqual("working", rows["p-1a2b3c4d"]["class"])
+        self.assertEqual(1, rows["p-1a2b3c4d"]["reads"]["commits"])
+        self.assertEqual("keep", rows["p-1a2b3c4d"]["action"])
+
+    def test_read_and_violated_twice_is_confusing(self) -> None:
+        rows = self.rows([
+            block("s1", read="p-1a2b3c4d"),
+            block("s2", read="p-1a2b3c4d", violated="p-1a2b3c4d", date="2026-08-29"),
+            block("s3", violated="p-1a2b3c4d", date="2026-08-30"),
+        ])
+        row = rows["p-1a2b3c4d"]
+        self.assertEqual("confusing", row["class"])
+        self.assertEqual("rewrite it, or promote it to a gate", row["action"])
+        self.assertEqual(2, row["reads"]["commits"])
+        self.assertEqual(2, row["reads"]["sessions"])  # the commit that only violated it read nothing
+        self.assertEqual("2026-08-30", row["violations"]["last"])
+
+    def test_read_and_violated_once_is_watch_not_working(self) -> None:
+        rows = self.rows([block("s1", read="p-1a2b3c4d", violated="p-1a2b3c4d")])
+        self.assertEqual("watch", rows["p-1a2b3c4d"]["class"])
+
+    def test_violated_without_ever_being_read_is_undiscoverable(self) -> None:
+        rows = self.rows([block("s1", violated="p-99887766")])
+        self.assertEqual("undiscoverable", rows["p-99887766"]["class"])
+        self.assertIn("discovery problem", rows["p-99887766"]["action"])
+
+    def test_silence_over_the_floor_splits_by_tests(self) -> None:
+        rows = self.rows(self.padding(self.FLOOR))
+        self.assertEqual("redundant", rows["p-1a2b3c4d"]["class"])        # has `**Tests:**`
+        self.assertEqual("decay-candidate", rows["p-99887766"]["class"])  # prose only
+
+    def test_silence_under_the_floor_is_unclassified(self) -> None:
+        rows = self.rows(self.padding(self.FLOOR - 1))
+        self.assertEqual("unclassified", rows["p-1a2b3c4d"]["class"])
+        self.assertEqual("unclassified", rows["p-99887766"]["class"])
+
+    def test_an_id_the_tree_lost_is_its_own_row(self) -> None:
+        rows = self.rows([block("s1", read="p-deadbeef", violated="p-deadbeef")])
+        self.assertIsNone(rows["p-deadbeef"]["path"])
+        self.assertEqual("watch", rows["p-deadbeef"]["class"])
+
+    def test_co_read_pairs_need_two_commits(self) -> None:
+        pairs = agent_telemetry.aggregate_commits(
+            [block("s1", read="p-1a2b3c4d p-99887766"), block("s2", read="p-1a2b3c4d p-cafed00d")], UNIVERSE
+        )["co_read_pairs"]
+        self.assertEqual([], pairs)
+        pairs = agent_telemetry.aggregate_commits(
+            [block("s1", read="p-1a2b3c4d p-99887766"), block("s2", read="p-99887766 p-1a2b3c4d")], UNIVERSE
+        )["co_read_pairs"]
+        self.assertEqual([{"ids": ["p-1a2b3c4d", "p-99887766"],
+                           "titles": ["Indexed premise", "Another indexed premise"], "commits": 2}], pairs)
+
+    def test_whole_file_reads_are_counted_by_path_not_credited_to_every_premise(self) -> None:
+        aggregated = agent_telemetry.aggregate_commits(
+            [block("s1", files="docs/shipping/premises.md")], UNIVERSE
+        )
+        self.assertEqual([{"path": "docs/shipping/premises.md", "commits": 1}], aggregated["files"])
+        self.assertTrue(all(item["reads"]["commits"] == 0 for item in aggregated["premises"]))
+
+
+class CommitSources(unittest.TestCase):
+    """The two sources, on a throwaway git repository: the branch log and `gh pr list`."""
+
+    def setUp(self) -> None:
+        self.repo = tempfile.mkdtemp(prefix="telemetry-commits-")
+        self.addCleanup(shutil.rmtree, self.repo, True)
+        self.bin = tempfile.mkdtemp(prefix="telemetry-bin-")
+        self.addCleanup(shutil.rmtree, self.bin, True)
+        # PATH is narrowed to this one directory while mining, so `test_gh_absent…` cannot reach the
+        # real `gh` of the machine. `git` is linked in because the miner needs it — the fake dir is the
+        # whole world, not a prefix of it.
+        os.symlink(shutil.which("git"), os.path.join(self.bin, "git"))
+        self.git("init", "-q")
+        self.git("symbolic-ref", "HEAD", "refs/heads/main")
+        for key, value in (("user.name", "Fixture"), ("user.email", "fixture@example.com"),
+                           ("commit.gpgsign", "false"), ("gc.auto", "0"), ("maintenance.auto", "false")):
+            self.git("config", "--local", key, value)
+
+    def git(self, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=self.repo, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+
+    def commit(self, message: str) -> None:
+        with open(os.path.join(self.repo, "file.txt"), "a", encoding="utf-8") as handle:
+            handle.write(message[:20] + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def fake_gh(self, payload) -> None:
+        """A fake `gh` answering the two calls the miner makes: `pr list --json number` (the numbers)
+        and `pr view <n> --json commits` (that PR's commits). Absolute shebang and only SHELL BUILTINS
+        in the body — no `cat`, no `printf` from /usr/bin — so it runs with PATH = the fake dir alone,
+        which is what makes `test_gh_absent…` honest."""
+        path = os.path.join(self.bin, "gh")
+        numbers = json.dumps([{"number": pull["number"]} for pull in payload]).replace("'", "'\\''")
+        script = ["#!/bin/sh", 'case "$2" in', "list)"]
+        # `printf '%s'`, never `echo`: /bin/sh on macOS expands the `\n` inside the JSON strings and
+        # the payload stops being valid JSON (this test caught it).
+        script.append("printf '%s\\n' '" + numbers + "' ;;")
+        script.append("view)")
+        script.append('case "$3" in')
+        for pull in payload:
+            body = json.dumps({"commits": pull["commits"]}).replace("'", "'\\''")
+            script.append("%s) printf '%%s\\n' '%s' ;;" % (pull["number"], body))
+        script += ["*) echo 'null' ;;", "esac ;;", "esac"]
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(script) + "\n")
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    def mine(self, prs: str = "none") -> dict:
+        previous = os.environ["PATH"]
+        os.environ["PATH"] = self.bin
+        try:
+            return agent_telemetry.build_commits(
+                self.repo, "main", WIDE_SINCE, WIDE_UNTIL, prs, universe=UNIVERSE
+            )
+        finally:
+            os.environ["PATH"] = previous
+
+    @staticmethod
+    def pr_payload(message: str, number: int = 42, oid: str = "abc123") -> list:
+        headline, _, body = message.partition("\n\n")
+        return [{"number": number, "commits": [{"oid": oid, "messageHeadline": headline, "messageBody": body,
+                                                "authors": [{"name": "Fixture"}],
+                                                "committedDate": "2026-08-29T10:00:00Z"}]}]
+
+    def test_branch_log_reads_the_trailers_out_of_a_squash_body(self) -> None:
+        self.commit(SQUASH_BODY)
+        mined = self.mine()
+        self.assertEqual(3, mined["totals"]["commits"])
+        self.assertEqual(2, mined["totals"]["sessions"])
+        self.assertEqual(1, mined["totals"]["violations"])
+        rows = {item["id"]: item for item in mined["premises"]}
+        self.assertEqual(2, rows["p-1a2b3c4d"]["reads"]["commits"])
+        self.assertEqual("watch", rows["p-99887766"]["class"])
+
+    def test_a_missing_branch_is_a_note_not_a_crash(self) -> None:
+        self.commit(SQUASH_BODY)
+        mined = agent_telemetry.build_commits(
+            self.repo, "nope", WIDE_SINCE, WIDE_UNTIL, "none", universe=UNIVERSE
+        )
+        self.assertEqual(0, mined["totals"]["commits"])
+        self.assertIn("does not exist", mined["sources"][0]["note"])
+
+    def test_open_pr_commits_join_the_branch_log(self) -> None:
+        self.commit("chore: nothing here\n")
+        self.fake_gh(self.pr_payload(
+            "fix(catalog): fix the split\n\nBody.\n\nPremises-Violated: p-1a2b3c4d\nAgent-Session: session-pr\n"
+        ))
+        mined = self.mine("open")
+        self.assertEqual(1, mined["totals"]["commits"])
+        self.assertEqual({item["id"]: item for item in mined["premises"]}["p-1a2b3c4d"]["violations"]["commits"], 1)
+        self.assertEqual("prs", mined["sources"][1]["source"])
+        self.assertEqual(1, mined["sources"][1]["commits"])
+
+    def test_the_same_commit_in_both_sources_counts_once(self) -> None:
+        """The squash-double-count risk: `--prs open` is the mitigation, this is the proof it holds even
+        when a branch commit and a PR commit carry the very same trailer block."""
+        self.commit("feat: first\n\nPremises-Read: p-1a2b3c4d\nAgent-Session: session-dup\n")
+        self.fake_gh(self.pr_payload("feat: first\n\nPremises-Read: p-1a2b3c4d\nAgent-Session: session-dup\n"))
+        mined = self.mine("open")
+        self.assertEqual(1, mined["totals"]["commits"])
+        self.assertEqual(1, mined["sources"][1]["duplicates_skipped"])
+        self.assertEqual(1, {item["id"]: item for item in mined["premises"]}["p-1a2b3c4d"]["reads"]["commits"])
+
+    def test_two_commits_of_one_session_in_the_same_pr_both_count(self) -> None:
+        """The dedupe is ACROSS sources, never inside one. Two commits of a session that read no
+        premise carry an identical trailer block — collapsing them undercounts the window, which is
+        what the first live run of this miner did to its own first two annotated commits."""
+        self.commit("chore: nothing here\n")
+        payload = self.pr_payload("feat: one\n\nAgent-Session: s-same\n", number=7)
+        payload[0]["commits"].append({"oid": "def456", "messageHeadline": "feat: two",
+                                      "messageBody": "Agent-Session: s-same\n",
+                                      "authors": [{"name": "Fixture"}],
+                                      "committedDate": "2026-08-30T10:00:00Z"})
+        self.fake_gh(payload)
+        mined = self.mine("open")
+        self.assertEqual(2, mined["totals"]["commits"])
+        self.assertEqual(0, mined["sources"][1]["duplicates_skipped"])
+        self.assertEqual(1, mined["totals"]["sessions"])
+
+    def test_a_pr_whose_commits_cannot_be_read_is_a_note_not_a_crash(self) -> None:
+        """The numbers listed fine and one `pr view` failed — the other PRs still count. The live run
+        hit the sibling of this: `pr list --json commits` asks GitHub for `PRs x commits x authors`
+        nodes in ONE query and is rejected over 500 000, which is why the numbers and the commits are
+        two calls."""
+        self.commit("chore: nothing here\n")
+        self.fake_gh(self.pr_payload("feat: x\n\nAgent-Session: s-pr\n", number=7))
+        # The list is patched to name a PR the fake cannot answer `pr view` for.
+        path = os.path.join(self.bin, "gh")
+        with open(path, encoding="utf-8") as handle:
+            script = handle.read()
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(script.replace('[{"number": 7}]', '[{"number": 7}, {"number": 8}]'))
+        mined = self.mine("open")
+        self.assertEqual(1, mined["totals"]["commits"])   # PR 7 still counted
+        self.assertIn("#8", mined["sources"][1]["note"])  # PR 8 named in the note
+
+    def test_the_note_names_the_real_gh_subcommand(self) -> None:
+        """A note is read by a human deciding whether to re-run: it has to name a command that EXISTS.
+        `gh list`/`gh view` are not commands; `gh pr list`/`gh pr view` are."""
+        path = os.path.join(self.bin, "gh")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\necho 'boom' >&2\nexit 1\n")
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        self.commit("chore: nothing here\n")
+        note = self.mine("open")["sources"][1]["note"]
+        self.assertIn("`gh pr list` failed", note)
+        self.assertNotIn("`gh list`", note)
+
+    def test_gh_absent_from_the_path_is_a_note_not_a_failure(self) -> None:
+        self.commit("feat: first\n\nPremises-Read: p-1a2b3c4d\nAgent-Session: session-1\n")
+        mined = self.mine("open")  # self.bin holds no `gh`
+        self.assertEqual(1, mined["totals"]["commits"])
+        self.assertIn("not on the PATH", mined["sources"][1]["note"])
+
+    def test_markdown_carries_the_matrix_and_the_flagged_lists(self) -> None:
+        self.commit(SQUASH_BODY)
+        rendered = agent_telemetry.render_commits(self.mine())
+        self.assertIn("| class | premises | action |", rendered)
+        self.assertIn("| watch | 1 |", rendered)
+        self.assertIn("## Confusing and undiscoverable", rendered)
+        self.assertIn("`p-99887766`", rendered)
+        self.assertIn("## Co-read pairs", rendered)
+
+
+class CommitsDocument(Harness):
+    def commits_section(self) -> dict:
+        return agent_telemetry.build_commits(
+            self.repo, "main", datetime.date(2026, 6, 1), datetime.date(2026, 8, 30), "none", universe=UNIVERSE
+        )
+
+    def v2_report(self) -> dict:
+        payload = self.payload(
+            hook_event_name="InstructionsLoaded",
+            file_path=os.path.join(self.repo, "CLAUDE.md"),
+            load_reason="session_start",
+        )
+        return self.report(self.records(payload))
+
+    def test_v3_is_a_superset_of_v2(self) -> None:
+        report = self.v2_report()
+        path = os.path.join(self.repo, "report.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle)
+        document = agent_telemetry.commits_document(self.commits_section(), path)
+        self.assertEqual(3, document["schema_version"])
+        for key in ("window", "surfaces", "premises", "candidates"):
+            self.assertEqual(report[key], document[key], key)
+        self.assertEqual(sorted(document["commits"]),
+                         ["classes", "co_read_pairs", "files", "premises", "sources", "totals", "window"])
+        json.loads(json.dumps(document))
+
+    def test_v3_without_a_report_leaves_the_v2_half_empty(self) -> None:
+        document = agent_telemetry.commits_document(self.commits_section(), None)
+        self.assertEqual(3, document["schema_version"])
+        self.assertEqual([], document["surfaces"])
+        self.assertEqual(0, document["window"]["sessions"])
+
+    def test_the_report_subcommand_still_emits_2(self) -> None:
+        self.assertEqual(2, self.v2_report()["schema_version"])
+
+    def test_render_markdown_of_a_v3_document_appends_the_matrix(self) -> None:
+        document = dict(self.v2_report())
+        document["commits"] = self.commits_section()
+        rendered = agent_telemetry.render_markdown(document)
+        self.assertIn("## Decay / demotion candidates", rendered)
+        self.assertIn("# Premise quality — read x violated", rendered)
+
+    def test_premise_sections_carry_the_tests_flag(self) -> None:
+        write(self.repo, {"docs/catalog/premises-tested.md":
+                          "# Catalog\n\n## Gated one\n**Id:** p-11112222\n**Tests:** `CatalogTest`\n\n"
+                          "## Prose one\n**Id:** p-33334444\nJust prose.\n"})
+        universe = {item[2]: item[3] for item in agent_telemetry.premises_universe(self.repo, self.config)}
+        self.assertTrue(universe["p-11112222"])
+        self.assertFalse(universe["p-33334444"])
 
 
 if __name__ == "__main__":

@@ -56,10 +56,13 @@ The sections (full schema + per-repo examples in [skills-config.template.md](./s
   ceilings table at its defaults unless the user objects.
 - **Intent** — the directory holding each unit of work's `intent.md` / `spec.md` / `plan.md`
   (default `intent/`). Keep it out of any published docs tree. `bootstrap` writes its README.
-- **Telemetry** — optional; only ask if the repo vendors `otel_headers.py` and wants OTLP export.
-  Everything defaults (endpoint `http://localhost:4318`, `http/protobuf`, variable
-  `CLAUDE_CODE_OTEL_API_KEY`, header `dd-api-key`). What to explain: the key comes from a GitHub
-  Actions **variable**, not a secret, and with no key the session simply exports nothing.
+- **Telemetry** — ask **Lanes** first: `git-only` (the default — the commit trailers and the load log,
+  no vendor, no endpoint), `otlp` or `both`. On `git-only`, record the **Default branch** the trailer
+  miner reads and **ask nothing else in this section**: no endpoint, no key variable, and the installer
+  writes no OTLP variables. Only on `otlp`/`both` ask for the rest; everything there defaults (endpoint
+  `http://localhost:4318`, `http/protobuf`, variable `CLAUDE_CODE_OTEL_API_KEY`, header `dd-api-key`).
+  What to explain then: the key comes from a GitHub Actions **variable**, not a secret, and with no key
+  the session simply exports nothing.
 - **Lint ratchet** — optional; only ask if the repo has a lint config and a suppression baseline worth
   freezing. **Production globs** is the one that arms both gates; without it they skip and pass.
 - **Models** — optional per-role model/effort overrides (`decision`, `worker`, `fixer`,
