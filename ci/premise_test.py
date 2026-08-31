@@ -198,6 +198,73 @@ class DepsTest(PremiseTestCase):
         self.assertNotIn("A shipping invariant", out)
 
 
+class IdOfTest(PremiseTestCase):
+    """The reverse lookup a review finding uses to turn a cited title into the id of the trailer."""
+
+    def test_the_exact_title_resolves_to_its_id(self) -> None:
+        code, out, err = self.run_main("--id-of", "Second invariant")
+        self.assertEqual(0, code, err)
+        self.assertEqual(MIDDLE, out.strip())
+        self.assertEqual("", err)
+
+    def test_a_title_in_another_file_resolves_too(self) -> None:
+        code, out, _ = self.run_main("--id-of", "A shipping invariant")
+        self.assertEqual(0, code)
+        self.assertEqual(OTHER, out.strip())
+
+    def test_the_match_is_case_sensitive(self) -> None:
+        code, out, err = self.run_main("--id-of", "second invariant")
+        self.assertEqual(1, code, out)
+        self.assertIn("no premise is titled 'second invariant'", err)
+        self.assertEqual("", out)
+
+    def test_a_partial_title_does_not_resolve(self) -> None:
+        code, _, err = self.run_main("--id-of", "Second")
+        self.assertEqual(1, code)
+        self.assertIn("no premise is titled", err)
+
+    def test_an_absent_title_exits_one(self) -> None:
+        code, _, err = self.run_main("--id-of", "No such invariant")
+        self.assertEqual(1, code)
+        self.assertIn("exact and case-sensitive", err)
+
+    def test_a_title_held_by_two_files_is_ambiguous(self) -> None:
+        self.write(
+            "docs/shipping/premises-extra.md",
+            self.read("docs/shipping/premises-extra.md").replace(
+                "## An invariant with no id at all", "## Second invariant"
+            ),
+        )
+        code, out, err = self.run_main("--id-of", "Second invariant")
+        self.assertEqual(1, code, out)
+        self.assertIn("ambiguous", err)
+        self.assertIn("docs/shipping/premises-extra.md", err)
+        self.assertIn("docs/catalog/premises.md", err)
+        self.assertEqual("", out)
+
+    def test_a_premise_without_an_id_exits_one_and_names_the_fix(self) -> None:
+        code, out, err = self.run_main("--id-of", "An invariant with no id at all")
+        self.assertEqual(1, code, out)
+        self.assertIn("has no **Id:**", err)
+        self.assertIn("assign-missing", err)
+
+    def test_a_link_heading_is_not_resolvable(self) -> None:
+        code, _, err = self.run_main("--id-of", "[A part map, not a premise](premises-pricing.md)")
+        self.assertEqual(1, code)
+        self.assertIn("no premise is titled", err)
+
+    def test_surrounding_whitespace_is_tolerated(self) -> None:
+        code, out, _ = self.run_main("--id-of", "  Second invariant\n")
+        self.assertEqual(0, code)
+        self.assertEqual(MIDDLE, out.strip())
+
+    def test_id_of_does_not_need_the_positional_target(self) -> None:
+        # `--id-of` is the whole command: no id/mint/assign-missing alongside it.
+        code, out, _ = self.run_main("--id-of", "First invariant")
+        self.assertEqual(0, code)
+        self.assertEqual(FIRST, out.strip())
+
+
 class MintTest(PremiseTestCase):
     def test_mint_never_collides_with_the_tree(self) -> None:
         taken = {section.id for section in premise.load(self.repo)}

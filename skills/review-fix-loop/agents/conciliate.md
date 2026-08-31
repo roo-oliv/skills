@@ -37,10 +37,10 @@ You receive the findings **already judged** (standard or deep) and produce **the
 - ...
 ```
 
-Write the comment in the commit/PR language from config › Conventions (code symbols stay in English). Lows are never listed — only counted.
+Write the comment in the commit/PR language from config › Conventions (code symbols stay in English). Lows are never listed — only counted. The comment ends with the fenced ```json review-findings``` block the prompt specifies (one entry per posted finding) — that is data for the quality-signal miner, not prose.
 
 ## Structured output (schema in the prompt)
 
-- `findings`: consolidated list `{ id, severity, title, file, line, description, confidence, premise, source }` — the `id`s must be **stable across runs** (same problem = same id; derive from file + short title, e.g. `sweep-cap-missing`), and `confidence`/`premise` pass through as the judge left them.
+- `findings`: consolidated list `{ id, severity, title, file, line, description, confidence, premise, source }` — the `id`s must be **stable across runs** (same problem = same id; derive from file + short title, e.g. `sweep-cap-missing`), and `confidence`/`premise` pass through as the judge left them (`premise` = the `p-xxxxxxxx` id of the violated premise; if a title arrives, resolve it with the premise fetch command and `--id-of "<title>"`, and pass the id).
 - `commentUrl`: URL of the posted comment.
 - `droppedAsContested`: ids dropped by an accepted contestation.
