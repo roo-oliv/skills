@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import datetime
 import io
+import glob
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -455,6 +457,58 @@ class HookContract(Harness):
             [directory], datetime.date(2026, 8, 20), datetime.date(2026, 8, 27)
         )
         self.assertEqual([r["path"] for r in records], ["CLAUDE.md"])
+
+
+class CheckoutResolution(Harness):
+    """Which checkout the log lands in. An agent isolated in a git worktree inherits
+    `CLAUDE_PROJECT_DIR` from the session that spawned it: writing there would put the load lines in a
+    repository the command never touched — and `hooks/context_hooks.py` READS this same `LOG_DIR` to
+    decide which premise trailers a commit owes, so a writer and a reader that disagree on the root
+    drop the signal in silence."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        previous = os.environ.get("CLAUDE_PROJECT_DIR")
+        os.environ["CLAUDE_PROJECT_DIR"] = self.repo
+        self.addCleanup(
+            lambda: os.environ.__setitem__("CLAUDE_PROJECT_DIR", previous)
+            if previous is not None
+            else os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        )
+
+    def git_repo(self) -> str:
+        repo = tempfile.mkdtemp(prefix="telemetry-worktree-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        # `git rev-parse --show-toplevel` answers the physical path, and on macOS $TMPDIR is a
+        # symlink — resolve it here so the fixture compares like with like.
+        return os.path.realpath(repo)
+
+    @staticmethod
+    def logs_in(root: str) -> list:
+        return sorted(glob.glob(os.path.join(root, agent_telemetry.LOG_DIR, "loads-*.jsonl")))
+
+    def instructions(self, path: str, cwd: str) -> dict:
+        return {"session_id": SESSION, "cwd": cwd, "hook_event_name": "InstructionsLoaded",
+                "file_path": path, "load_reason": "session_start"}
+
+    def test_the_log_lands_in_the_checkout_of_the_payload_cwd(self) -> None:
+        other = self.git_repo()
+        write(other, {"CLAUDE.md": "# other\n"})
+        self.run_hook(self.instructions(os.path.join(other, "CLAUDE.md"), other))
+        self.assertEqual([], self.logs_in(self.repo))  # NOT under $CLAUDE_PROJECT_DIR
+        written = self.logs_in(other)
+        self.assertEqual(1, len(written))
+        with open(written[0], encoding="utf-8") as handle:
+            record = json.loads(handle.read().splitlines()[0])
+        self.assertEqual("CLAUDE.md", record["path"])  # normalized against the right root
+
+    def test_a_cwd_that_is_not_a_checkout_keeps_the_old_precedence(self) -> None:
+        plain = tempfile.mkdtemp(prefix="telemetry-plain-")
+        self.addCleanup(shutil.rmtree, plain, True)
+        self.run_hook(self.instructions(os.path.join(self.repo, "CLAUDE.md"), plain))
+        self.assertEqual(1, len(self.logs_in(self.repo)))
+        self.assertEqual([], self.logs_in(plain))
 
 
 if __name__ == "__main__":

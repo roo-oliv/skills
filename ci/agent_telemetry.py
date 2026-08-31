@@ -46,6 +46,7 @@ import glob
 import json
 import os
 import shlex
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -81,9 +82,30 @@ CANDIDATE_KINDS = (RULE_SCOPED, SKILL, DOC)
 # ── hook ──────────────────────────────────────────────────────────────────────────────────────────
 
 
+def payload_root(payload: dict) -> str:
+    """The checkout the command runs in, from the payload's cwd — empty when that is not a git repo."""
+    cwd = payload.get("cwd")
+    if not cwd:
+        return ""
+    try:
+        done = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except Exception:  # noqa: BLE001 — a missing git is "no root", not a crash in a hook
+        return ""
+    return done.stdout.decode("utf-8", "replace").strip()
+
+
 def project_root(payload: dict) -> str:
-    """The repository the session runs in: the harness variable, the payload cwd, then this process."""
-    for candidate in (os.environ.get("CLAUDE_PROJECT_DIR"), payload.get("cwd")):
+    """The repository the session runs in: the command's checkout, the harness variable, this process.
+
+    The cwd wins over `CLAUDE_PROJECT_DIR` because an agent isolated in a git worktree inherits the
+    MOTHER session's variable, and the log would land in a repository the command never touched. It
+    has to be the same rule `project_root` in `hooks/context_hooks.py` uses: that hook READS `LOG_DIR`
+    to decide which trailers a commit owes, and a reader and a writer that disagree on the root lose
+    the signal silently.
+    """
+    for candidate in (payload_root(payload), os.environ.get("CLAUDE_PROJECT_DIR"), payload.get("cwd")):
         if candidate:
             return os.path.abspath(candidate)
     return os.getcwd()

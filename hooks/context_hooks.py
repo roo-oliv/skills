@@ -12,19 +12,25 @@ one in prose, and which domains are sensitive all come from `docs/agents/skills-
 (`skills_config.py`, vendored beside this file). With no config the hooks stay silent.
 
 Wired in `.claude/settings.json` on UserPromptSubmit, PreToolUse (Write|mcp__.*) and PostToolUse
-(Read|Edit|Write|Bash) — see `settings/hooks.json`. Two argv services back the PR gate:
+(Read|Edit|Write|Bash) — see `settings/hooks.json`. Three argv services back the PR gate:
 
-    context_hooks.py gate-input        # stdin: the PreToolUse payload -> "<gh pr subcommand>\\n<ttl>"
+    context_hooks.py gate-input        # stdin: the PreToolUse payload -> "<gh pr subcommand>\\n<ttl>\\n<root>"
     context_hooks.py sensitive-domains # stdin: changed paths -> the sensitive domains they touch
+    context_hooks.py commit-gate       # stdin: the PreToolUse payload -> exit 2 + remediation, or 0
+
+`commit-gate` is the one service here that blocks (exit 2). Everything else is silent and fail-open.
 """
 
 from __future__ import annotations
 
+import datetime
+import glob
 import json
 import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 from fnmatch import fnmatch
@@ -54,6 +60,20 @@ ARGV_WRAPPERS = ("nohup", "sudo", "command", "time", "env", "xargs", "timeout", 
 DURATION_RE = re.compile(r"^[0-9]+(\.[0-9]+)?[smhd]?$")
 HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
 SEGMENT_RE = re.compile(r"\n|;|&&|\|\||\||\$\(|\(|\)")
+
+# The commit-trailers gate. A commit message is the only store every session already writes to, that
+# survives a squash-merge and that `git log` can mine across people and machines — which is why the
+# premise-quality signal lives there. The values are DERIVED from the load log `agent_telemetry.py`
+# writes; the agent only carries the strings the gate dictates.
+TELEMETRY_DIR = os.path.join(".claude", "telemetry")
+TRAILER_READ = "Premises-Read"
+TRAILER_FILES = "Premises-Files-Read"
+TRAILER_SESSION = "Agent-Session"
+MAX_TRAILER_IDS = 40
+TRAILER_GIT_MIN = (2, 32)
+# `git commit` forms that reuse or rewrite an existing message: the trailers already live in the
+# message being reused, and a commit already pushed must never be rewritten to gain them.
+REUSE_FLAGS = ("--amend", "--fixup", "--squash", "--reuse-message", "--reedit-message", "-C", "-c")
 
 # Every injected message is one line; `{d}` is the domain, `{tokens}` what the text actually named.
 NO_INDEX = "no premises index yet — read {premises}"
@@ -85,8 +105,21 @@ def disabled(name):
     return "all" in parts or name in parts
 
 
+def payload_root(payload):
+    """The checkout the COMMAND runs in, from the payload's cwd — empty when that is not a git repo.
+
+    An agent isolated in a git worktree keeps the mother session's `CLAUDE_PROJECT_DIR`, so trusting
+    that variable makes every gate read the WRONG checkout: the load log, the sentinel and the branch
+    diff would all come from a repository the command never touched. The env of a hook comes from the
+    harness, so neither `CLAUDE_PROJECT_DIR=` nor `CONTEXT_HOOKS_DISABLE=` in front of the command can
+    correct it — the payload's cwd is the only honest source.
+    """
+    cwd = payload.get("cwd")
+    return git_output(cwd, ["rev-parse", "--show-toplevel"]) if cwd else ""
+
+
 def project_root(payload):
-    return os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd") or os.getcwd()
+    return payload_root(payload) or os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd") or os.getcwd()
 
 
 def load_config(root):
@@ -328,6 +361,8 @@ def on_post_tool(payload, root, config, session):
     if tool == "Bash":
         command = tool_input.get("command") or ""
         mark(session, config, command)
+        if not disabled("trailers"):
+            stamp_commit(root, payload.get("session_id") or "", command)
         if not disabled("query"):
             remind(session, root, config, command, False, "PostToolUse", (QUERY_HEAD, QUERY_MISS))
         return
@@ -344,8 +379,8 @@ def on_post_tool(payload, root, config, session):
 # ── argv services for the PR gate ─────────────────────────────────────────────────────────────────
 
 
-def gh_pr_subcommand(command):
-    """`create`/`ready` only when argv says so — `echo "gh pr create"` and heredoc bodies must not match."""
+def command_segments(command):
+    """The command split into runnable segments, heredoc bodies dropped before the split."""
     lines = []
     terminator = None
     for line in (command or "").split("\n"):
@@ -357,10 +392,21 @@ def gh_pr_subcommand(command):
         opener = HEREDOC_RE.search(line)
         if opener:
             terminator = opener.group(2)
-    for segment in SEGMENT_RE.split("\n".join(lines)):
-        tokens = argv_of(segment)
-        if tokens[:1] in (["bash"], ["sh"], ["zsh"]) and "-c" in tokens:
-            tokens = argv_of(tokens[-1])
+    return SEGMENT_RE.split("\n".join(lines))
+
+
+def segment_argv(segment):
+    """The argv of one segment, wrappers peeled and one level of `bash -c` reapplied."""
+    tokens = argv_of(segment)
+    if tokens[:1] in (["bash"], ["sh"], ["zsh"]) and "-c" in tokens:
+        tokens = argv_of(tokens[-1])
+    return tokens
+
+
+def gh_pr_subcommand(command):
+    """`create`/`ready` only when argv says so — `echo "gh pr create"` and heredoc bodies must not match."""
+    for segment in command_segments(command):
+        tokens = segment_argv(segment)
         if tokens[:2] == ["gh", "pr"] and tokens[2:3] and tokens[2] in ("create", "ready"):
             return tokens[2]
     return ""
@@ -388,9 +434,165 @@ def argv_of(segment):
     return tokens
 
 
+# ── the commit-trailers gate ──────────────────────────────────────────────────────────────────────
+
+
+def reuses_message(token):
+    return token in REUSE_FLAGS or any(token.startswith(f + "=") for f in REUSE_FLAGS if f.startswith("--"))
+
+
+def git_commit_of(command):
+    """True when argv says the command creates a NEW commit — the only one the trailers gate covers.
+
+    `echo "git commit"`, a heredoc body, `git merge`, `git revert` and every message-reusing form
+    (`--amend`, `--fixup`, `--squash`, `-C`) are not one: rewriting a commit the agent already saw
+    (or already pushed) to add trailers is exactly the magic this toolkit rules out.
+    """
+    for segment in command_segments(command):
+        tokens = segment_argv(segment)
+        if tokens[:2] != ["git", "commit"] or any(reuses_message(t) for t in tokens[2:]):
+            continue
+        return True
+    return False
+
+
+def utc_stamp():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
+
+
+def sentinel_path(root, session_id):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
+    return os.path.join(root, TELEMETRY_DIR, "session-{}.head".format(safe))
+
+
+def read_sentinel(root, session_id):
+    """`{head, ts}` of the last commit this session annotated — the start of the current window."""
+    try:
+        with open(sentinel_path(root, session_id), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def session_loads(root, session_id, since):
+    """Load-log lines of THIS session written after the last annotated commit."""
+    records = []
+    for path in sorted(glob.glob(os.path.join(root, TELEMETRY_DIR, "loads-*.jsonl"))):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict) or record.get("session_id") != session_id:
+                continue
+            if since and (record.get("ts") or "") <= since:
+                continue
+            records.append(record)
+    return records
+
+
+def required_trailers(root, session_id):
+    """The exact `Key: value` strings this commit must carry — counted from the log, never judged."""
+    ids, files, id_paths = [], [], {}
+    for record in session_loads(root, session_id, read_sentinel(root, session_id).get("ts")):
+        read, path, premise_id = record.get("read"), record.get("path"), record.get("premise_id")
+        if read in ("fetch", "range") and premise_id:
+            if premise_id not in ids:
+                ids.append(premise_id)
+                id_paths[premise_id] = path
+        elif read == "whole" and path and path not in files:
+            files.append(path)
+    ids.sort()
+    # Over the ceiling the tail degrades to its file: a trailer listing 73 ids is noise, not signal.
+    for premise_id in ids[MAX_TRAILER_IDS:]:
+        if id_paths.get(premise_id) and id_paths[premise_id] not in files:
+            files.append(id_paths[premise_id])
+    trailers = []
+    if ids:
+        trailers.append("{}: {}".format(TRAILER_READ, ", ".join(ids[:MAX_TRAILER_IDS])))
+    if files:
+        trailers.append("{}: {}".format(TRAILER_FILES, ", ".join(sorted(files))))
+    trailers.append("{}: {}".format(TRAILER_SESSION, session_id))
+    return trailers
+
+
+def git_output(root, args):
+    try:
+        done = subprocess.run(["git"] + args, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return ""
+    return done.stdout.decode("utf-8", "replace").strip()
+
+
+def supports_trailer_flag(root):
+    """`git commit --trailer` landed in git 2.32; below it the remediation has to be message text."""
+    match = re.search(r"(\d+)\.(\d+)", git_output(root, ["--version"]))
+    return (int(match.group(1)), int(match.group(2))) >= TRAILER_GIT_MIN if match else True
+
+
+def block_message(command, missing, root):
+    lines = [
+        "🚫 commit-trailers gate: blocked.",
+        "",
+        "This `git commit` runs inside an agent session and does not carry the premise-quality",
+        "trailers. The values below are computed by the hook from this session's load log — they are",
+        "not a judgement call, so copy them as they are.",
+        "",
+    ]
+    if supports_trailer_flag(root):
+        lines.append("Add to the `git commit`:")
+        lines += ['  --trailer "{}"'.format(trailer) for trailer in missing]
+        lines += ["", "Same command with them appended (move the flags onto the `git commit` if it is",
+                  "not the last one):", ""]
+        lines.append(command.rstrip() + " " + " ".join('--trailer "{}"'.format(t) for t in missing))
+    else:
+        lines.append("This git has no `--trailer` (needs {}.{}). End the commit message with:".format(*TRAILER_GIT_MIN))
+        lines += ["  " + trailer for trailer in missing]
+    lines += ["", "Escape (audited): CONTEXT_HOOKS_DISABLE=trailers."]
+    return "\n".join(lines)
+
+
+def commit_gate(payload):
+    """PreToolUse(Bash): 0 allows, 2 blocks with the remediation on stderr. Fail-open everywhere else."""
+    if disabled("trailers"):
+        sys.stderr.write("commit-trailers gate: disabled via CONTEXT_HOOKS_DISABLE — allowing.\n")
+        return 0
+    session_id = payload.get("session_id") or ""
+    command = (payload.get("tool_input") or {}).get("command") or ""
+    if not session_id or not git_commit_of(command):
+        return 0
+    root = project_root(payload)
+    missing = [trailer for trailer in required_trailers(root, session_id) if trailer not in command]
+    if not missing:
+        return 0
+    sys.stderr.write(block_message(command, missing, root) + "\n")
+    return 2
+
+
+def stamp_commit(root, session_id, command):
+    """Once a commit lands, the window of the next one starts at this HEAD — written only when it moved."""
+    if not session_id or not git_commit_of(command):
+        return
+    head = git_output(root, ["rev-parse", "HEAD"])
+    if not head or head == read_sentinel(root, session_id).get("head"):
+        return
+    path = sentinel_path(root, session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"head": head, "ts": utc_stamp()}, handle)
+
+
 def gate_input(payload):
     print(gh_pr_subcommand((payload.get("tool_input") or {}).get("command") or ""))
     print(ENGAGED_TTL_MIN)
+    print(payload_root(payload))
 
 
 def sensitive_domains(raw, root):
@@ -431,6 +633,8 @@ def main():
     if mode == ["gate-input"]:
         gate_input(payload)
         return
+    if mode == ["commit-gate"]:
+        sys.exit(commit_gate(payload))
     session_id = payload.get("session_id") or ""
     event = payload.get("hook_event_name") or ""
     if not session_id or not event:

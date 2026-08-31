@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# PR gate — PreToolUse hook on Bash. Two gates on `gh pr create` / `gh pr ready`:
+# PR gate — PreToolUse hook on Bash. Three gates: one on `git commit`, two on `gh pr create` /
+# `gh pr ready`:
 #
+#   0. commit-trailers gate — a `git commit` made inside an agent session must carry the premise
+#      trailers the session's load log dictates (Agent-Session, Premises-Read, Premises-Files-Read).
 #   1. premises-index gate — the branch touches a sensitive domain and NO session in this worktree
 #      read that domain's premises index recently. Read the index and retry.
 #   2. deep-plan gate — `gh pr create` on a sensitive branch without a COMPLETE plan-contract (a
@@ -16,7 +19,8 @@
 #   exit 2 + stderr   -> block; stderr is surfaced to the agent (PreToolUse convention)
 #
 # Overrides: `[deep-plan-override: <reason>]` in the args or DEEP_PLAN_OVERRIDE=<reason> skips the
-# deep-plan gate; CONTEXT_HOOKS_DISABLE=gate skips the premises-index gate. Both audited to stderr.
+# deep-plan gate (and NOTHING else); CONTEXT_HOOKS_DISABLE=gate skips the premises-index gate and
+# CONTEXT_HOOKS_DISABLE=trailers the commit-trailers one. All audited to stderr.
 #
 # Fail-open by design: any ambiguity that isn't a clear "incomplete contract on a sensitive branch"
 # allows the command through. Recognition is by ARGV, not substring: `echo "gh pr create"` and
@@ -26,12 +30,16 @@ set -uo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Resolve the repo root robustly: the checkout the COMMAND runs in wins (line 3 of gate-input, from
+# the payload's cwd — an agent isolated in a worktree keeps the mother session's CLAUDE_PROJECT_DIR
+# and every gate would measure the wrong checkout), then the harness-provided dir, then the git
+# toplevel (so the gate still works from a subdirectory), then the cwd.
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-}"
 if [ -z "$PROJECT_DIR" ]; then
   PROJECT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 fi
 
-# --- 1. Read the tool input and ask context_hooks.py what it is ------------
+# --- 0. Read the tool input and run the commit-trailers gate ---------------
 # Only read stdin when it is piped (the harness pipes the tool-input JSON); the TTY guard stops a
 # manual interactive run from hanging on cat waiting for EOF.
 if [ ! -t 0 ]; then
@@ -40,13 +48,29 @@ else
   payload=""
 fi
 
-# Two lines: the `gh pr` subcommand recognised BY ARGV (empty when the command merely contains the
-# words), and the engaged-sentinel TTL in minutes.
+# The commit gate answers on stderr only (exit 2 = block, 0 = allow, including the audited escape),
+# so 2>&1 into a variable and replay it. It runs before everything else because a `git commit` is
+# not a `gh pr` command and would otherwise leave through the early exit below.
+# A code other than 0/2 is the gate itself failing (no python3, unreadable script): stay quiet and
+# allow — a broken gate must never be the reason a commit cannot be made.
+commit_gate_out="$(printf '%s' "$payload" | python3 "$HOOK_DIR/context_hooks.py" commit-gate 2>&1)"
+commit_gate_code=$?
+if [ "$commit_gate_code" -eq 0 ] || [ "$commit_gate_code" -eq 2 ]; then
+  [ -n "$commit_gate_out" ] && printf '%s\n' "$commit_gate_out" >&2
+  [ "$commit_gate_code" -eq 2 ] && exit 2
+fi
+
+# --- 1. Ask context_hooks.py what the command is ---------------------------
+# Three lines: the `gh pr` subcommand recognised BY ARGV (empty when the command merely contains the
+# words), the engaged-sentinel TTL in minutes, and the repo the command runs in (empty when the
+# payload carries no cwd, or it is not a git checkout).
 sub=""
 TTL_MIN=""
-{ read -r sub; read -r TTL_MIN; } < <(
+payload_root=""
+{ read -r sub; read -r TTL_MIN; read -r payload_root; } < <(
   printf '%s' "$payload" | python3 "$HOOK_DIR/context_hooks.py" gate-input 2>/dev/null || true
 )
+[ -n "${payload_root:-}" ] && PROJECT_DIR="$payload_root"
 [ -z "${sub:-}" ] && exit 0
 [ -z "${TTL_MIN:-}" ] && exit 0
 
