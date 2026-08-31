@@ -39,8 +39,8 @@ same config.
 
 | Toolkit | Pieces | Doc |
 |---|---|---|
-| **Context** | `ci/context_lint.py` (CI gate: ceilings, frontmatter, every reference that must resolve), `ci/premise.py` (read ONE premise by stable id), `ci/context_decay.py` (monthly: what stopped describing anything alive), `hooks/context_hooks.py` (puts a domain's premises index on the *reasoning* path), `hooks/deep-plan-pr-gate.sh`, `rules/context.md`, `rules/premises.md` | [`docs/context-toolkit.md`](docs/context-toolkit.md) |
-| **Telemetry** | `ci/agent_telemetry.py` (which surface loaded, and why — per file and per premise), `ci/otel_headers.py` (OTLP auth header from a repo variable), `settings/env.json` | [`docs/telemetry.md`](docs/telemetry.md) |
+| **Context** | `ci/context_lint.py` (CI gate: ceilings, frontmatter, every reference that must resolve; `--near-duplicates` reports premises to merge), `ci/premise.py` (read ONE premise by stable id, or resolve a title to its id), `ci/context_decay.py` (monthly: what stopped describing anything alive), `hooks/context_hooks.py` (puts a domain's premises index on the *reasoning* path, and gates the premise trailers on every session commit), `hooks/deep-plan-pr-gate.sh`, `rules/context.md`, `rules/premises.md` | [`docs/context-toolkit.md`](docs/context-toolkit.md) |
+| **Telemetry** | two lanes. **A, git-only (default):** `ci/agent_telemetry.py` — which surface loaded and why, plus `commits`, which mines the premise trailers out of the branch log and the open PRs into a read x violated matrix. **B, OTLP (optional):** `ci/otel_headers.py` (auth header from a repo variable), `settings/env.json` | [`docs/telemetry.md`](docs/telemetry.md) |
 | **Lint ratchet** | `ci/lint_ratchet.py` (`config-rides-alone`, `cpd-delta`), `ci/refactor_ratio.py` + its workflow example | [`docs/lint-ratchet.md`](docs/lint-ratchet.md) |
 
 ## How portability works
@@ -51,8 +51,8 @@ That file declares the verify command, where premises and their index live and h
 fetched by id, which domains are *sensitive* (and so get the heavy planning/review path) and which
 words name them in a prompt, the repo's key flows (each becomes a dedicated review lens), the intent
 directory, per-role model/effort overrides, the commit/PR conventions, and — optional, each with a
-working default — the context-toolkit paths and ceilings, the telemetry destination and the lint
-ratchet's file lists. **A missing section is never an error**: the default applies and the tool says
+working default — the context-toolkit paths and ceilings, which telemetry lanes are on (and, for lane B,
+the OTLP destination) and the lint ratchet's file lists. **A missing section is never an error**: the default applies and the tool says
 so in its output.
 
 So the first run on a new repo is:
@@ -154,6 +154,19 @@ Things that cost real debugging time here:
   preflight aborts when it finds it set.
 - **`$CLAUDE_PROJECT_DIR` does not expand inside `otelHeadersHelper`** (unlike hooks), so that value
   resolves the repo root with `git rev-parse --show-toplevel`.
+- **Hooks are read once, at session start.** Changing a gate does not affect the session you changed it
+  in — open a new one before concluding the gate does not fire.
+- **A subagent inherits its mother's `session_id`.** `Agent-Session` therefore identifies the *session*,
+  not the agent; a fan-out of ten lenses is one session in the trailer report.
+- **An agent isolated in a git worktree still inherits `$CLAUDE_PROJECT_DIR` from the session that
+  spawned it**, so a hook that trusts the variable exercises the *wrong* checkout — not the worktree the
+  command runs in. Every gate here resolves the repo from the payload's `cwd` instead, and a hook's
+  environment comes from the harness, so no command prefix can correct it after the fact.
+- **`gh pr list --json commits` is rejected over 500 000 GraphQL nodes** — `PRs x commits x authors` in
+  one query — and the source then reads as *empty*, silently. List the numbers, then ask each PR for its
+  commits.
+- **Dedupe trailer blocks BETWEEN sources, never inside one.** Two commits of the same session that read
+  no premise carry byte-identical trailers; collapsing them undercounts the window.
 
 ## Invocation
 

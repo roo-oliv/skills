@@ -11,7 +11,7 @@ the skills and the docs.
 | [`ci/context_decay.py`](../ci/context_decay.py) | `.github/scripts/` | monthly report: which surfaces may have stopped describing anything alive |
 | [`ci/skills_config.py`](../ci/skills_config.py) | `.github/scripts/` + `.claude/hooks/` | the one config reader all of the above share |
 | [`hooks/context_hooks.py`](../hooks/context_hooks.py) | `.claude/hooks/` | puts a domain's premises index on the *reasoning* path, not just the file path |
-| [`hooks/deep-plan-pr-gate.sh`](../hooks/deep-plan-pr-gate.sh) | `.claude/hooks/` | blocks a PR on a sensitive branch with no premises read and no complete plan-contract |
+| [`hooks/deep-plan-pr-gate.sh`](../hooks/deep-plan-pr-gate.sh) | `.claude/hooks/` | blocks a session commit with no premise trailers, and a PR on a sensitive branch with no premises read and no complete plan-contract |
 | [`rules/context.md`](../rules/context.md), [`rules/premises.md`](../rules/premises.md) | `.claude/rules/` | the directives an author follows — the charter and the premise format |
 
 `scripts/install.sh` vendors all of it and merges `settings/hooks.json` and `settings/env.json` into the
@@ -21,7 +21,7 @@ consuming repo (schema: `skills/setup/skills-config.template.md`), with the defa
 
 The installer vendors two more script families that read the same config but answer different questions:
 [`ci/agent_telemetry.py`](../ci/agent_telemetry.py) + [`ci/otel_headers.py`](../ci/otel_headers.py)
-([`docs/telemetry.md`](telemetry.md) — it is what feeds decay signal D3), and
+([`docs/telemetry.md`](telemetry.md) — it is what feeds decay signals D3 and D8), and
 [`ci/lint_ratchet.py`](../ci/lint_ratchet.py) + [`ci/refactor_ratio.py`](../ci/refactor_ratio.py)
 ([`docs/lint-ratchet.md`](lint-ratchet.md)).
 
@@ -88,6 +88,7 @@ on a file the author never opened.
 python3 .github/scripts/context_lint.py --base origin/main   # what CI runs: the delta against the base
 python3 .github/scripts/context_lint.py                      # ceilings only; the delta degrades to WARN
 python3 .github/scripts/context_lint.py --write-indices      # regenerate every premises index (C15)
+python3 .github/scripts/context_lint.py --near-duplicates    # premise pairs to merge (report, feeds D9)
 python3 .github/scripts/premise.py mint                      # an id for a new premise (C17)
 python3 .github/scripts/premise.py <id> --deps               # read ONE premise, plus what it depends on
 python3 .github/scripts/context_decay.py --since 90          # the monthly decay report
@@ -128,6 +129,13 @@ one naming signal. Age qualifies; it never names.
 | D5 `dead-scope` | a rule whose `paths:` globs match no tracked file — it never loads |
 | D6 `unreachable` | a doc not reachable from the docs index by links or backticked paths |
 | D7 `promotion-due` | a failure-mode entry with `Occurrences ≥ 2` still `advisory` — a gate is owed |
+| D8 `quality` | the commit trailers class the premise `confusing` (read **and** violated ≥ 2x) or `undiscoverable` (violated, never read) — telemetry `schema_version: 3` ([`docs/telemetry.md`](telemetry.md)) |
+| D9 `near-duplicate` | the premise is paired with another by `context_lint.py --near-duplicates`, passed in with `--duplicates` |
+
+D8 and D9 are decided **before** the rule that keeps a doc cited by a stable surface: neither is a
+deletion — rewriting a confusing premise and merging two near-identical ones are things you do to a doc
+that is alive. Without `--telemetry` at v3 the scan says so and skips D8; without `--duplicates` it says
+so and skips D9, and it distinguishes "no report given" from "report read, zero pairs".
 
 The human decides per candidate and one PR effects the round; the routine, the decision rules and the banner
 grammar are the runbook `bootstrap` scaffolds from `skills/bootstrap/context-decay.template.md`. The rule that
@@ -156,14 +164,17 @@ work at all: it replaces a schema-index parser that only one repo's docs layout 
 **Contract**: the harness pipes the tool-input JSON on stdin; the hook prints
 `{"hookSpecificOutput": {"hookEventName": …, "additionalContext": …}}` on stdout, or nothing. They inform, they
 never block. **Fail-open is the design, not a side effect**: a malformed payload, a missing `session_id`, an
-absent file or any exception exits 0 with no stdout.
+absent file or any exception exits 0 with no stdout. The commit-trailers gate below is the only one that
+exits 2, and even it allows on an unreadable log, a missing `git` or any exception.
 
 **State** lives in empty sentinel files under `$CLAUDE_PROJECT_DIR/.claude/.context-hooks/{session_id}/`, where
 the mtime is the clock: `engaged-{domain}` (someone consulted that domain, TTL 240 min), `reminded-{domain}` /
-`nudged-{domain}` (once per session), `charter-shown`. It is **per worktree**, not per machine: two worktrees
+`nudged-{domain}` (once per session), `charter-shown`. The commit gate's own sentinel lives beside the
+load log, in `.claude/telemetry/session-<id>.head`. It is **per worktree**, not per machine: two worktrees
 never mix state, and it survives a reboot inside the TTL. Sessions older than 24 h are pruned on write.
 
-**The PR gate** (`deep-plan-pr-gate.sh`, PreToolUse on Bash) carries two gates, in order: the *premises-index
+**The gates** (`deep-plan-pr-gate.sh`, PreToolUse on Bash) run in order: the *commit-trailers gate* (its
+own section below, the only one that blocks a `git commit`), the *premises-index
 gate* (`gh pr create` and `gh pr ready`: the branch touches a sensitive domain whose `engaged-{domain}` sentinel
 is missing or stale in **every** session of this worktree → blocked, with the indices to read) and the
 *deep-plan gate* (`gh pr create` only: a sensitive branch needs a complete plan-contract). Worktree-wide, not
@@ -174,9 +185,73 @@ audited to stderr: `CONTEXT_HOOKS_DISABLE=gate` for the first, `[deep-plan-overr
 **Recognition is by argv, not substring.** The command is split on `;`, `&&`, `||`, `|`, `$(`, `(` and newlines;
 heredoc bodies are dropped first; `NAME=value` prefixes are skipped; one level of `bash -c` is re-parsed; the
 usual wrappers (`nohup`, `sudo`, `env`, `timeout`, `xargs`, `time`, `command`, `stdbuf`, `setsid`) are peeled.
-It matches only when argv is literally `gh pr create` / `gh pr ready`. This is not cosmetic: an argv the gate
+A gate matches only when argv is literally `gh pr create` / `gh pr ready` — or, for the trailers gate,
+`git commit` with no message-reusing flag. This is not cosmetic: an argv the gate
 does not recognise means **no gate runs at all**, which a substring matcher did not risk — so the wrapper list is
 part of the contract, and every case is a test.
+
+### The commit-trailers gate
+
+Section 0 of the same script, and the one hook in this toolkit that **blocks**. A `git commit` made
+inside an agent session must carry the trailers the session's load log dictates — `Agent-Session`
+always, `Premises-Read` for the ids read by `fetch`/`range` since the sentinel (ceiling 40 ids; the tail
+degrades to its file), `Premises-Files-Read` for whole-file reads. Why a commit message is the right
+store, and what is mined out of it, is [`docs/telemetry.md`](telemetry.md) › Lane A.
+
+The block message hands over the exact strings to copy, because a remediation the model has to
+re-derive defeats the point of deriving it from the log:
+
+```
+🚫 commit-trailers gate: blocked.
+
+This `git commit` runs inside an agent session and does not carry the premise-quality
+trailers. The values below are computed by the hook from this session's load log — they are
+not a judgement call, so copy them as they are.
+
+Add to the `git commit`:
+  --trailer "Premises-Read: p-1a2b3c4d, p-5e6f7a8b"
+  --trailer "Agent-Session: 8f21…"
+
+Same command with them appended (move the flags onto the `git commit` if it is
+not the last one):
+
+git commit -m "feat: x" --trailer "Premises-Read: …" --trailer "Agent-Session: …"
+
+Escape (audited): CONTEXT_HOOKS_DISABLE=trailers.
+```
+
+Only the **missing** trailers enter the remediation. `git commit --trailer` needs git ≥ 2.32; below it
+the remediation becomes text to append to the message. `DEEP_PLAN_OVERRIDE` does **not** disable this
+gate — it is not the deep-plan gate.
+
+**What is not a commit** (same argv recognition as the PR gate, wrappers peeled and heredoc bodies
+dropped): `echo "git commit"`, `git merge`, `git revert`, and every message-reusing form — `--amend`,
+`--fixup`, `--squash`, `-C`/`--reuse-message`, `-c`/`--reedit-message`. Rewriting a commit the agent
+already saw — or already pushed — to give it a trailer is exactly the magic this toolkit rules out; a
+silent `--amend` was the rejected alternative.
+
+**The window** is the session's load log since the last commit this session annotated, marked by the
+sentinel `.claude/telemetry/session-<id>.head` (`{head, ts}`), written on PostToolUse of `Bash` only
+when `git rev-parse HEAD` actually moved.
+
+**Which checkout every gate measures** is the repo of the payload's `cwd` (`git rev-parse
+--show-toplevel` from there), and only then `$CLAUDE_PROJECT_DIR`, the process toplevel, the cwd. This
+is not a detail: an agent isolated in a **git worktree** inherits the mother session's
+`CLAUDE_PROJECT_DIR`, so a gate that trusts the variable reads the wrong checkout — the load log, the
+sentinel and the branch diff all come from a repository the command never touched. In one production
+repo that shipped as a `gh pr create` blocked over six sensitive domains that were not on the branch at
+all. It cannot be corrected from the command line either: a hook's environment comes from the harness,
+so neither `CLAUDE_PROJECT_DIR=` nor `CONTEXT_HOOKS_DISABLE=` as a command prefix reaches it. The
+telemetry logger resolves the root by the same rule on purpose — the writer of the log and the reader of
+it disagreeing on the root would lose the signal in silence.
+
+**Known limits.** A commit made outside a session (a human at the terminal) gets no trailer, and that is
+the right population: the trailers measure what the agent produced. `git -c x=y commit` escapes the
+gate, because recognition requires `argv[0:2] == git commit` — and escaping means *no* gate ran, never
+an extra block. And `Premises-Read` is in practice the `fetch` path: a windowed read logs the premise's
+title, not its id, so directed fetches by id are what fill the trailer while a whole-file read falls
+into `Premises-Files-Read`.
+
 
 ## Three traps this toolkit exists to avoid
 
