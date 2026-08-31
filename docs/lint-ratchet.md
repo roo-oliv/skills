@@ -19,6 +19,11 @@ The ratchet inverts the direction:
 Everything below is config-driven ([`skills/setup/skills-config.template.md`](../skills/setup/skills-config.template.md)
 › `## Lint ratchet`) and **off until `Production globs` is filled in**.
 
+It is the same shape as the other two toolkits, applied to a different surface: the ratchet freezes the
+legacy and gates the delta of the *lint* configuration, the way
+[`docs/context-toolkit.md`](context-toolkit.md) gates the delta of every *doc* reference, and
+[`docs/telemetry.md`](telemetry.md) measures what those surfaces are actually worth.
+
 ## The two gates
 
 [`ci/lint_ratchet.py`](../ci/lint_ratchet.py) runs in seconds, needs only `python3` and `git`, and is

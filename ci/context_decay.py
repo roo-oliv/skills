@@ -12,11 +12,14 @@ A surface is a CANDIDATE only when it carries at least one naming signal. Age qu
   D5 dead-scope    a rule whose `paths:` glob matches no tracked file (all globs dead = the rule never loads)
   D6 unreachable   a doc not reachable from the docs index by links or backticked paths
   D7 promotion-due a recurring-failure-modes entry with `Occurrences >= 2` still `advisory` (a gate owed)
+  D8 quality      a premise the commit trailers class as `confusing` (read AND violated twice) or
+                  `undiscoverable` (violated without ever being read) — telemetry schema_version 3
+  D9 near-duplicate  a premise paired with another by `context_lint.py --near-duplicates` (`--duplicates`)
 
 This is a REPORT, not a gate: it always exits 0. The human decides per candidate and one PR effects the
 round — the routine, the decision rules and the banner grammar live in the decay runbook.
 
-    python3 .github/scripts/context_decay.py --since 90 [--telemetry report.json]
+    python3 .github/scripts/context_decay.py --since 90 [--telemetry report.json] [--duplicates dups.json]
 
 Out of the universe by design: the generated premises index (rebuilt from the premises themselves, so
 every H2 of it would read as permanently `zero-load` and the file as permanently unreachable) and the
@@ -53,7 +56,10 @@ BANNER_RE = re.compile(r"^>\s*\*\*(\d{4}-\d{2}-\d{2}):?\*\*:?\s*(superseded|kept
 DATED_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 BANNER_WINDOW = 15
 RENAME_BRACE_RE = re.compile(r"^(.*)\{(.*) => (.*)\}(.*)$")
-TELEMETRY_VERSIONS = (1, 2)
+TELEMETRY_VERSIONS = (1, 2, 3)
+# The classes of `agent_telemetry.py commits` that name a premise as a PROBLEM, and nothing else:
+# `working`/`redundant`/`decay-candidate`/`watch`/`unclassified` are states, not queues.
+QUALITY_CLASSES = ("confusing", "undiscoverable")
 PREMISE_ID_RE = re.compile(r"^\*\*Id:\*\*\s*`?(p-[A-Za-z0-9]+)`?")
 
 
@@ -268,6 +274,7 @@ class Telemetry:
     surfaces: dict[str, dict]
     premises: dict[tuple[str, str], dict]
     premises_by_id: dict[str, dict]
+    quality_by_id: dict[str, dict]  # v3 only: the `commits` section, one row per premise id
 
 
 def telemetry(path: str | None) -> tuple[Telemetry | None, str]:
@@ -290,7 +297,37 @@ def telemetry(path: str | None) -> tuple[Telemetry | None, str]:
     premises = {(row["path"], row["title"]): row for row in rows if row.get("title")}
     premises_by_id = {row["id"]: row for row in rows if row.get("id")}
     sessions = int((payload.get("window") or {}).get("sessions") or 0)
-    return Telemetry(int(version), sessions, surfaces, premises, premises_by_id), path
+    quality = {
+        row["id"]: row
+        for row in ((payload.get("commits") or {}).get("premises") or [])
+        if row.get("id")
+    }
+    return Telemetry(int(version), sessions, surfaces, premises, premises_by_id, quality), path
+
+
+def duplicates(path: str | None) -> tuple[list | None, str]:
+    """The pairs of `context_lint.py --near-duplicates --format json`, plus the note.
+
+    `None` means D9 was NOT EVALUATED (no file, missing, unreadable); `[]` means it WAS evaluated and
+    the tree has no pair over the threshold — the plausible, desirable outcome. Conflating the two
+    would print "D9 not evaluated" next to a summary line naming the file that was read, which is the
+    same distinction `telemetry()` draws with `None` vs. an empty report.
+    """
+    if not path:
+        return None, "absent"
+    if not os.path.exists(path):
+        return None, f"{path} (missing — D9 not evaluated)"
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as error:
+        return None, f"{path} (unreadable: {error} — D9 not evaluated)"
+    pairs = [
+        pair
+        for pair in (payload.get("pairs") or [])
+        if isinstance(pair, dict) and (pair.get("a") or {}).get("path") and (pair.get("b") or {}).get("path")
+    ]
+    return pairs, path
 
 
 # ── failure-mode entries (D7) ─────────────────────────────────────────────────────────────────────
@@ -338,6 +375,7 @@ class Report:
     notes: list[str] = field(default_factory=list)
     since_days: int = 90
     telemetry_note: str = "absent"
+    duplicates_note: str = "absent"
     docs_index: str = "docs/index.md"
 
 
@@ -362,6 +400,12 @@ def suggest_action(candidate: Candidate, config: skills_config.Config) -> str:
     # which exists to stop a cited doc from being DELETED.
     if candidate.actions.get("D5") == DEAD_GLOB_ACTION:
         return DEAD_GLOB_ACTION
+    # D8 and D9 are there for the same reason: rewriting a confusing premise and merging two
+    # near-identical ones are not deletions, so being cited by a stable doc is no argument against them.
+    if "D8" in signals:
+        return candidate.actions["D8"]
+    if "D9" in signals:
+        return candidate.actions["D9"]
     stable = candidate.stable
     if stable:
         return f"keep (evidence cited by {len(stable)} stable doc(s))"
@@ -384,6 +428,7 @@ def scan(
     telemetry_path: str | None,
     today: dt.date,
     config: skills_config.Config | None = None,
+    duplicates_path: str | None = None,
 ) -> Report:
     repo = os.path.abspath(repo)
     config = config or skills_config.load(repo)
@@ -398,6 +443,14 @@ def scan(
         report.notes.append("D3 not evaluated (no telemetry report)")
     elif telemetry_data.version < 2:
         report.notes.append("per-premise D3 not evaluated (schema_version 1 report)")
+    if telemetry_data is not None and telemetry_data.version < 3:
+        report.notes.append(
+            f"D8 not evaluated (schema_version {telemetry_data.version} report, no `commits` section)"
+        )
+    duplicate_pairs, report.duplicates_note = duplicates(duplicates_path)
+    if duplicate_pairs is None:
+        report.notes.append("D9 not evaluated (no near-duplicates report)")
+        duplicate_pairs = []
 
     by_path: dict[str, Candidate] = {}
 
@@ -468,8 +521,12 @@ def scan(
                 elif path in by_path:
                     by_path[path].loads = str(loads)
 
+    premises = live_premises(repo, surfaces, config)
     if telemetry_data is not None and telemetry_data.version >= 2:
-        add_premise_candidates(repo, surfaces, telemetry_data, config, candidate_for)
+        add_premise_candidates(premises, telemetry_data, candidate_for)
+    if telemetry_data is not None and telemetry_data.version >= 3:
+        add_quality_candidates(premises, telemetry_data, candidate_for)
+    add_duplicate_candidates(premises, duplicate_pairs, candidate_for)
 
     for candidate in by_path.values():
         candidate.citers = cited_by(repo, candidate.path, config)
@@ -486,22 +543,26 @@ def scan(
     return report
 
 
-def add_premise_candidates(
-    repo: str,
-    surfaces: list[str],
-    data: Telemetry,
-    config: skills_config.Config,
-    candidate_for,
-) -> None:
-    """D3 per premise: the FILE is loaded and this H2 never is — a section nobody reads inside a doc
-    everybody reads. A file with zero loads is already a D3 row; its premises would only repeat it."""
+def live_premises(repo: str, surfaces: list[str], config: skills_config.Config) -> list:
+    """Every premise the tree carries today — the join target of the per-premise signals D3, D8 and D9."""
     lint_surfaces = context_lint.Surfaces(config)
     docs = {
         path: context_lint.parse_doc(path, read(repo, path))
         for path in surfaces
         if lint_surfaces.is_premises(path) and not config.is_premises_index(path)
     }
-    for premise in context_lint.collect_premises(docs, lint_surfaces):
+    return context_lint.collect_premises(docs, lint_surfaces)
+
+
+def premise_label(premise: context_lint.Premise) -> str:
+    """One label per premise, shared by D3, D8 and D9 so their signals land on the SAME row."""
+    return f"{premise.path} › {premise.title}"
+
+
+def add_premise_candidates(premises: list, data: Telemetry, candidate_for) -> None:
+    """D3 per premise: the FILE is loaded and this H2 never is — a section nobody reads inside a doc
+    everybody reads. A file with zero loads is already a D3 row; its premises would only repeat it."""
+    for premise in premises:
         row = None
         identifier = premise_id(premise)
         if identifier:
@@ -513,12 +574,47 @@ def add_premise_candidates(
         surface = data.surfaces.get(premise.path)
         if surface is None or int(surface.get("loads") or 0) <= 0:
             continue
-        entry = candidate_for(premise.path, f"{premise.path} › {premise.title}")
+        entry = candidate_for(premise.path, premise_label(premise))
         entry.signals.append("D3")
         entry.evidence["D3"] = "premise never loaded inside a file that loads"
         entry.loads = "/".join(
             str(int(row.get(field_name) or 0)) for field_name in ("loads_range", "loads_whole", "loads_fetch")
         )
+
+
+def add_quality_candidates(premises: list, data: Telemetry, candidate_for) -> None:
+    """D8: the commit trailers say this premise was read AND violated twice (`confusing`), or violated
+    without ever being read (`undiscoverable`). Both are counts of what happened, never a judgement of
+    the text — the action the row carries is the one `agent_telemetry.py` prints for the class."""
+    for premise in premises:
+        row = data.quality_by_id.get(premise_id(premise) or "")
+        if row is None or row.get("class") not in QUALITY_CLASSES:
+            continue
+        entry = candidate_for(premise.path, premise_label(premise))
+        entry.signals.append("D8")
+        entry.evidence["D8"] = (
+            f"{row['class']} (read {int((row.get('reads') or {}).get('commits') or 0)}x, "
+            f"violated {int((row.get('violations') or {}).get('commits') or 0)}x)"
+        )
+        entry.actions["D8"] = row.get("action") or "rewrite it, or promote it to a gate"
+
+
+def add_duplicate_candidates(premises: list, pairs: list, candidate_for) -> None:
+    """D9: two premises whose rationales are near-identical. ONE candidate per pair, on the first of the
+    two — the decision is "merge these", taken once, not twice."""
+    by_key = {(premise.path, premise.title): premise for premise in premises}
+    for pair in pairs:
+        left, right = pair["a"], pair["b"]
+        premise = by_key.get((left["path"], left.get("title")))
+        if premise is None:  # the pair names a premise the tree no longer carries: nothing to merge
+            continue
+        entry = candidate_for(premise.path, premise_label(premise))
+        entry.signals.append("D9")
+        entry.evidence["D9"] = (
+            "near-duplicate of %s › %s (%.2f)" % (right["path"], right.get("title") or "—",
+                                                  float(pair.get("ratio") or 0.0))
+        )
+        entry.actions["D9"] = "merge the two into one premise"
 
 
 def premise_id(premise: context_lint.Premise) -> str | None:
@@ -567,7 +663,7 @@ def render(report: Report) -> str:
         "",
         f"context-decay: {len(report.candidates)} candidate(s) ({breakdown}) · "
         f"{len(report.promotions)} promotion(s) due · window {report.since_days}d · "
-        f"telemetry: {report.telemetry_note}",
+        f"telemetry: {report.telemetry_note} · duplicates: {report.duplicates_note}",
     ]
     for note in report.notes:
         lines.append(f"context-decay: {note}")
@@ -583,6 +679,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=os.getcwd())
     parser.add_argument("--since", type=int, default=90, help="window in days for the dated signal (D4)")
     parser.add_argument("--telemetry", default=None, help="JSON report of the telemetry collector (optional)")
+    parser.add_argument("--duplicates", default=None,
+                        help="JSON of `context_lint.py --near-duplicates --format json` (optional, D9)")
     parser.add_argument("--today", default=None, help="ISO date overriding today (deterministic runs)")
     parser.add_argument(
         "--config", default=None, help=f"path to the config (default: <repo>/{skills_config.CONFIG_PATH})"
@@ -591,7 +689,7 @@ def main(argv: list[str] | None = None) -> int:
 
     config = skills_config.load(args.repo, args.config)
     today = dt.date.fromisoformat(args.today) if args.today else dt.date.today()
-    print(render(scan(args.repo, args.since, args.telemetry, today, config)))
+    print(render(scan(args.repo, args.since, args.telemetry, today, config, args.duplicates)))
     return 0
 
 

@@ -11,12 +11,15 @@ the worktree, and asserts which check codes come back and at which severity.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import hashlib
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -668,6 +671,73 @@ class FailureModeTest(ContextLintTestCase):
         )
         result = self.lint()
         self.assertNotIn("C16", result.codes, self.render(result))
+
+
+class NearDuplicatesTest(ContextLintTestCase):
+    """`--near-duplicates` is a REPORT: it names pairs to merge, it never fails a build."""
+
+    def pairs(self, threshold: float = context_lint.DUPLICATE_THRESHOLD) -> list:
+        return context_lint.near_duplicates(self.repo, threshold)["pairs"]
+
+    def titles(self, pairs: list) -> list:
+        return sorted(tuple(sorted((pair["a"]["title"], pair["b"]["title"]))) for pair in pairs)
+
+    def test_distinct_premises_are_not_a_pair(self) -> None:
+        # The untouched fixture: three premises that share a field skeleton and nothing else.
+        self.assertEqual([], self.pairs())
+
+    def test_a_planted_near_duplicate_is_found(self) -> None:
+        original = "`CatalogService` writes only under the row lock."
+        self.append(
+            "docs/catalog/premises-pricing.md",
+            premise("CatalogService writes under lock, restated", original + " Always, on every path."),
+        )
+        pairs = self.pairs()
+        self.assertEqual(
+            [("CatalogService writes only under lock", "CatalogService writes under lock, restated")],
+            self.titles(pairs),
+        )
+        self.assertGreaterEqual(pairs[0]["ratio"], context_lint.DUPLICATE_THRESHOLD)
+        self.assertEqual({"docs/catalog/premises.md", "docs/catalog/premises-pricing.md"},
+                         {pairs[0]["a"]["path"], pairs[0]["b"]["path"]})
+        self.assertTrue(pairs[0]["a"]["id"].startswith("p-"))
+
+    def test_the_word_prefilter_never_drops_a_pair_over_the_threshold(self) -> None:
+        # Two bodies 80 % alike as sequences necessarily share most words: the guard is that the cheap
+        # filter sits BELOW the expensive one, so an admitted pair is admitted by both.
+        left = context_lint.word_set("the pure kernel decides the value paid under the lock")
+        right = context_lint.word_set("the pure kernel decides the value paid under the lock, always")
+        self.assertGreaterEqual(context_lint.jaccard(left, right), context_lint.DUPLICATE_PREFILTER)
+        self.assertLess(context_lint.jaccard(left, context_lint.word_set("nothing at all in common")),
+                        context_lint.DUPLICATE_PREFILTER)
+
+    def test_three_hundred_premises_stay_well_under_the_minute(self) -> None:
+        """The n² pair space is the whole risk of this mode; the prefilter is what makes it cheap.
+        A 600-premise tree runs in ~1 s — the bound here is the target, not the measurement."""
+        body = "\n".join(
+            premise("Synthetic premise %d" % index, "Rationale number %d about subject %d." % (index, index))
+            for index in range(300)
+        )
+        self.write("docs/catalog/premises-synthetic.md", "# Catalog Premises — synthetic\n\n" + body)
+        started = time.monotonic()
+        report = context_lint.near_duplicates(self.repo)
+        self.assertGreaterEqual(report["premises"], 300)
+        self.assertLess(time.monotonic() - started, 60.0)
+
+    def test_the_report_exits_zero_and_renders_both_formats(self) -> None:
+        self.append(
+            "docs/catalog/premises-pricing.md",
+            premise("CatalogService writes under lock, restated",
+                    "`CatalogService` writes only under the row lock. Always, on every path."),
+        )
+        for extra in ([], ["--format", "json"]):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                self.assertEqual(0, context_lint.main(["--repo", self.repo, "--near-duplicates"] + extra))
+            self.assertIn("CatalogService writes under lock, restated", captured.getvalue())
+        rendered = context_lint.render_near_duplicates(context_lint.near_duplicates(self.repo))
+        self.assertIn("| ratio | a | b |", rendered)
+        self.assertIn("CatalogService writes under lock, restated", rendered)
 
 
 if __name__ == "__main__":

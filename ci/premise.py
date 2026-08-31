@@ -3,6 +3,7 @@
 
     python3 .github/scripts/premise.py p-1a2b3c4d           # the section: the H2 line to the next H2 (or EOF)
     python3 .github/scripts/premise.py p-1a2b3c4d --deps    # plus the premises it points at (one level)
+    python3 .github/scripts/premise.py --id-of "<H2 title>" # the id of the premise with that exact title
     python3 .github/scripts/premise.py mint                 # a fresh id no premise in the tree holds
     python3 .github/scripts/premise.py assign-missing       # write `**Id:**` under every H2 that has none
 
@@ -10,6 +11,11 @@ Why an id instead of a title: the `Read` tool caps at 2.000 lines, so "read the 
 silently truncates a large domain; and a title gets retitled while the invariant does not. The id is
 minted once, sits right below the H2, and survives a retitle or a file split. `context_lint.py` C17
 keeps it present and unique; the generated premises index is where a reader picks it up.
+
+`--id-of` is the reverse lookup, for a writer holding only the title — a review finding that cites a
+premise by name (`FINDING.premise` in `workflows/review-fix-loop.js`) resolves it to the id the
+`Premises-Violated` trailer carries. The match is EXACT and case-sensitive on the H2 text; ambiguous
+or absent exits 1, because guessing here would attribute a violation to the wrong invariant.
 
 This script carries its own scanner — os.walk over the premises tree, no git, no full-tree parse — so
 a fetch stays well under 100 ms. The premise shape it recognises is the one
@@ -33,6 +39,7 @@ import skills_config  # noqa: E402
 
 ID_FIELD = "**Id:**"
 DEPENDS_FIELD = "**Depends on:**"
+TESTS_FIELD = "**Tests:**"
 ID_RE = re.compile(r"^\*\*Id:\*\* (p-[0-9a-f]{8})\s*$")
 ID_TOKEN_RE = re.compile(r"\bp-[0-9a-f]{8}\b")
 WIKI_RE = re.compile(r"\[\[([^\]]+)\]\]")
@@ -51,6 +58,12 @@ class Section:
     @property
     def text(self) -> str:
         return "\n".join(self.lines)
+
+    @property
+    def has_tests(self) -> bool:
+        """Does the premise carry a `**Tests:**` field? That is the difference between an invariant a
+        test already enforces and one that lives only as prose — `redundant` vs. `decay-candidate`."""
+        return any(line.startswith(TESTS_FIELD) for line in self.lines[1:])
 
 
 def normalise(text: str) -> str:
@@ -218,10 +231,31 @@ def render(section: Section) -> str:
     return f"# {section.path} › {section.title}\n{section.text}"
 
 
+def print_id_of(sections: list[Section], title: str) -> int:
+    """Print the id of the premise whose H2 is exactly `title`. 1 when absent, ambiguous or id-less."""
+    wanted = title.strip()
+    matches = [section for section in sections if section.title == wanted]
+    if not matches:
+        print(f"premise: no premise is titled '{wanted}' (the match is exact and case-sensitive)", file=sys.stderr)
+        return 1
+    if len(matches) > 1:
+        where = ", ".join(f"{s.path}:{s.start}" for s in matches)
+        print(f"premise: the title '{wanted}' is ambiguous — held by {where}", file=sys.stderr)
+        return 1
+    if not matches[0].id:
+        print(f"premise: '{wanted}' ({matches[0].path}) has no **Id:** — run `assign-missing`", file=sys.stderr)
+        return 1
+    print(matches[0].id)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read one premise by its `**Id:**`.")
-    parser.add_argument("target", help="a premise id (p-xxxxxxxx), or the command `mint` / `assign-missing`")
+    parser.add_argument(
+        "target", nargs="?", help="a premise id (p-xxxxxxxx), or the command `mint` / `assign-missing`"
+    )
     parser.add_argument("--deps", action="store_true", help="also print the premises this one points at")
+    parser.add_argument("--id-of", dest="id_of", metavar="TITLE", help="print the id of the premise with this H2")
     parser.add_argument("--repo", default=skills_config.default_repo())
     parser.add_argument(
         "--config", default=None, help=f"path to the config (default: <repo>/{skills_config.CONFIG_PATH})"
@@ -229,6 +263,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = skills_config.load(args.repo, args.config)
 
+    if args.id_of is not None:
+        return print_id_of(load(args.repo, config), args.id_of)
+    if args.target is None:
+        parser.error("a premise id, `mint`, `assign-missing` or --id-of is required")
     if args.target == "mint":
         print(mint(load(args.repo, config)))
         return 0

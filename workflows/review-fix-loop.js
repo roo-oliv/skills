@@ -112,7 +112,7 @@ const FINDING = {
     description: { type: 'string', maxLength: 500, description: 'concrete scenario where something observable goes wrong' },
     suggestedFix: { type: 'string', maxLength: 300 },
     confidence: { type: 'integer', minimum: 1, maximum: 10, description: '10 = reproduced by a test/trace with file:line; 8 = mechanism traced in the code with file:line and no contrary guard found; 6 = plausible, not traced; 5 or less = speculation' },
-    premise: { type: 'string', maxLength: 160, description: 'optional: EXACT title of the documented premise this finding violates' },
+    premise: { type: 'string', maxLength: 160, pattern: '^p-[0-9a-f]{8}$|.{3,160}', description: 'optional: the p-xxxxxxxx id of the documented premise this finding violates (an exact H2 title is still accepted; the premise fetch command from ' + CONFIG + ' resolves one with --id-of "<title>")' },
     source: { type: 'string', maxLength: 80, description: 'lens | judge | fix-review | @human | <bot>' },
   },
 }
@@ -156,6 +156,7 @@ const FIX_RESULT = {
     diverged: { type: 'array', maxItems: 20, items: { type: 'object', required: ['id', 'reason'], properties: { id: { type: 'string', maxLength: 60 }, reason: { type: 'string', maxLength: 300 } } } },
     commits: { type: 'array', items: { type: 'string', maxLength: 40 }, maxItems: 15 },
     prBodyUpdated: { type: 'boolean' },
+    violatedTrailer: { type: 'boolean', description: 'true iff EVERY commit of this fix carries the --trailer "Premises-Violated: …" the prompt handed over (false when the prompt asked for no trailer)' },
     blockedReason: { type: 'string', maxLength: 500 },
   },
 }
@@ -223,11 +224,46 @@ function contractNote() {
 }
 
 function confidenceNote() {
-  return `Every finding carries "confidence" (1–10, rubric in the schema): 10 = reproduced; 8 = mechanism traced in the code with file:line and no contrary guard; 6 = plausible, not traced; 5 or less = speculation. Below 8 the finding is DISCARDED in code before the judge — do not inflate the number, just don't report what you did not trace. If the finding violates a documented premise, fill "premise" with that premise's exact title.`
+  return `Every finding carries "confidence" (1–10, rubric in the schema): 10 = reproduced; 8 = mechanism traced in the code with file:line and no contrary guard; 6 = plausible, not traced; 5 or less = speculation. Below 8 the finding is DISCARDED in code before the judge — do not inflate the number, just don't report what you did not trace. If the finding violates a documented premise, fill "premise" with its ID (p-xxxxxxxx — the **Id:** right below the H2; it is in the premises index and in the header the fetch command prints). Only if you have nothing but the title, pass the exact H2 title — whoever uses the field resolves it with the fetch command from ${CONFIG} › Docs layout › Premise fetch command, with --id-of "<title>" in place of the id (default: python3 .github/scripts/premise.py --id-of "<title>").`
 }
 
 function dispositionsNote() {
   return `Disposition rule (also a review criterion): every case a diff handles carries one of four dispositions, visible in the diff — (1) inexpressible (the type/state model cannot represent it); (2) validated at the boundary (once, producing a typed error); (3) supported (with a test); (4) impossible (an assertion at the seam, no branch). A handled case with NO disposition — a defensive branch, a silent fallback, a broad catch with no disposition, an impossible case handled by a conditional instead of an assertion at the seam — is a finding (Medium; High when it masks a load-bearing value or state). Boundary complement: tolerate what an external provider may ADD (unknown fields), never what VIOLATES its spec (missing required field, wrong type, value out of range) — silent recovery entrenches the bug downstream.`
+}
+
+// ---------------------------------------------------------------------------
+// Per-premise quality store: the posted comment ends with a `json review-findings`
+// block (data, not prose — the miner crosses it with the commits' trailers) and the
+// fix carries `Premises-Violated` with the violated ids. The ids come out of the JS,
+// never out of the agent's opinion: this is counting, not judgement.
+// ---------------------------------------------------------------------------
+
+const PREMISE_ID_RE = /^p-[0-9a-f]{8}$/
+
+function premiseIdsIn(findings) {
+  const ids = []
+  for (const f of findings || []) {
+    const p = typeof f.premise === 'string' ? f.premise.trim() : ''
+    if (PREMISE_ID_RE.test(p) && !ids.includes(p)) ids.push(p)
+  }
+  return ids.sort()
+}
+
+function premiseTitlesIn(findings) {
+  const titles = []
+  for (const f of findings || []) {
+    const p = typeof f.premise === 'string' ? f.premise.trim() : ''
+    if (p && !PREMISE_ID_RE.test(p) && !titles.includes(p)) titles.push(p)
+  }
+  return titles.sort()
+}
+
+function idOfCommand() {
+  return `the premise fetch command from ${CONFIG} › Docs layout › Premise fetch command with --id-of "<title>" in place of the id (default: python3 .github/scripts/premise.py --id-of "<title>")`
+}
+
+function findingsBlockNote(what) {
+  return `END the comment with a fenced \`\`\`json review-findings block — a JSON array with one {"id","severity","confidence","premise","file"} entry per ${what}, exactly the ones you listed above (\`premise\` = the p-xxxxxxxx id, or "" when the finding cites no premise; resolve a title with ${idOfCommand()}). It is data for the quality-signal miner, not prose: no comments inside the block, and never an entry that is not in the comment.`
 }
 
 function scopePrompt() {
@@ -293,16 +329,34 @@ ${JSON.stringify(findings, null, 2)}
 
 ${scope && scope.scoped === false ? `SCOPE: the scope agent judged that this PR does not solve a single problem — "${scope.problem}" (${scope.reason}). Add a "Scope" section with the recommendation to slice it and the suggested slices: ${JSON.stringify(scope.suggestedSlices || [])}. It is a recommendation to the author, not a block.` : ''}
 
-Lows are NOT listed — only counted, on the line "**Lows**: N (not listed)". Blocker, High and Medium all go in.`
+Lows are NOT listed — only counted, on the line "**Lows**: N (not listed)". Blocker, High and Medium all go in.
+
+${findingsBlockNote('POSTED finding (the Blocker/High/Medium; Lows stay out, as in the body)')}`
 }
 
 function fixerPrompt(findings, opts) {
+  const violated = premiseIdsIn(findings)
+  const titles = premiseTitlesIn(findings)
+  const trailer = violated.length ? `--trailer "Premises-Violated: ${violated.join(', ')}"` : ''
+  const resolveNote = titles.length
+    ? ` ${violated.length ? 'Besides those ids' : 'No finding cites the premise by id, but'} ${titles.length} finding(s) cite the premise by TITLE (${JSON.stringify(titles)}): resolve each with ${idOfCommand()} and add the id to the trailer's list, alphabetically (exit 1 = unresolved: leave it out).`
+    : ''
   return `${ctx()}
 
 Read ${ROLE_DIR}/fixer.md and operate as that agent${opts.second ? ' — this is the SECOND and last fix: the previous fix-review found Blocker/High' : ''}.
 
 Address the Blocker/High/Medium below: implement, run the TARGETED verify (the incremental Verify command from ${CONFIG} › Verify plus the always-run gates listed there — the FULL build stays with the PR's CI, which is the authoritative gate), commit, push, update the PR description, and reply on the PR whenever you decide to diverge from a finding, with the why.
+${trailer ? `
+MANDATORY TRAILER — add to EVERY \`git commit\` of this fix, literally, this string (do not rewrite it, do not reorder it, do not invent ids):
 
+    ${trailer}
+
+It comes from the assigned findings, not from your assessment: these are the premises whose violation this fix corrects.${resolveNote} Return "violatedTrailer": true iff every commit you created carries the trailer.
+` : titles.length ? `
+MANDATORY TRAILER — the assigned findings do cite premises, but by title, so you resolve the id:${resolveNote} With the ids in hand, add \`--trailer "Premises-Violated: <ids separated by ', '>"\` to EVERY \`git commit\` of this fix and return "violatedTrailer": true; if no title resolves there is no trailer and "violatedTrailer" is false.
+` : `
+No assigned finding cites a premise, so there is NO \`Premises-Violated\` trailer to include: return "violatedTrailer": false.
+`}
 After you, ONE fix-review runs (on a model different from yours) over your diff${opts.second ? ', and nothing else' : ''}. There is no depth round: whatever is not addressed here is left to the CI review and the human reviewer.
 
 Assigned findings:
@@ -322,6 +376,8 @@ ${confidenceNote()}
 ${contractNote()}
 
 Post a comment on the PR (gh pr comment ${PR} --body-file <tmpfile>) in the commit/PR language from ${CONFIG} › Conventions, with the marker <!-- review-fix-loop: fix-review --> and both lists; return the URL in "commentUrl". "verdict": "open" iff there is a Blocker/High in regressions or unaddressed.
+
+${findingsBlockNote('item of "regressions" and of "unaddressed" (for an unaddressed item use its severity, confidence 8 and the "premise" of the original posted finding)')}
 
 Findings posted in the review:
 ${JSON.stringify(posted, null, 2)}`
@@ -405,6 +461,11 @@ log(`review posted: ${con?.commentUrl || 'comment not confirmed'}`)
 
 const state = { fixed: [], diverged: [] }
 const allCommits = []
+// The ids the JS DEMANDED in the trailer of a fix that actually ran (never of a blocked/crashed one),
+// and the fixer's confirmation kept separately: demanded ≠ confirmed, and it is that pair that lets the
+// miner see a promised trailer that never reached the git log. null = no fix ever owed a trailer.
+const premisesViolated = []
+let premisesTrailerConfirmed = null
 const fixReviews = []
 let finalStatus = 'done'
 let blockedReason = null
@@ -413,6 +474,7 @@ let assigned = posted.filter((f) => f.severity !== 'Low')
 for (let pass = 1; pass <= 2 && assigned.length; pass++) {
   phase('Fix')
   const suffix = pass === 2 ? '-2' : ''
+  const demanded = premiseIdsIn(assigned)
   const fix = await tryAgent(fixerPrompt(assigned, { second: pass === 2 }), { schema: FIX_RESULT, label: `fix${suffix}`, phase: 'Fix', ...ROLE.fixer })
   if (!fix || fix.status === 'blocked') {
     finalStatus = 'blocked'
@@ -422,7 +484,11 @@ for (let pass = 1; pass <= 2 && assigned.length; pass++) {
   state.fixed.push(...(fix.fixed || []))
   state.diverged.push(...(fix.diverged || []))
   allCommits.push(...(fix.commits || []))
-  log(`fix ${pass}: ${(fix.fixed || []).length} fixed, ${(fix.diverged || []).length} divergence(s), ${(fix.commits || []).length} commit(s)`)
+  if (demanded.length) {
+    for (const id of demanded) if (!premisesViolated.includes(id)) premisesViolated.push(id)
+    premisesTrailerConfirmed = premisesTrailerConfirmed !== false && fix.violatedTrailer === true
+  }
+  log(`fix ${pass}: ${(fix.fixed || []).length} fixed, ${(fix.diverged || []).length} divergence(s), ${(fix.commits || []).length} commit(s), Premises-Violated demanded=${demanded.join(', ') || '—'} (fixer confirmed the trailer: ${fix.violatedTrailer === true})`)
 
   phase('Fix-review')
   const fr = await tryAgent(
@@ -480,6 +546,8 @@ return {
   fixReviews,
   openHighBlocker: assigned,
   acceptance,
+  premisesViolated, // ids DEMANDED in the Premises-Violated trailer of a fix that ran
+  premisesTrailerConfirmed, // did the fixer confirm the trailer on every fix that owed one? null = none owed
   commits: allCommits,
   fixed: state.fixed,
   diverged: state.diverged,

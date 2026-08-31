@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import os
 import re
 import subprocess
@@ -1052,8 +1053,10 @@ class Premise:
     def has_field(self, field_name: str) -> bool:
         return any(line.startswith(field_name) for line in self.body)
 
-    def measured(self) -> tuple[int, int]:
-        """Body lines/bytes with the `**Why/Breaks/Tests/Depends on:**` blocks and trailing blanks removed."""
+    def measured_text(self) -> str:
+        """The body with the `**Id/Why/Breaks/Tests/Depends on:**` blocks and trailing blanks removed —
+        the RATIONALE alone. Every premise carries the same field skeleton, so two short ones read as
+        80 % alike on the skeleton before a word of their content is compared."""
         kept: list[str] = []
         in_field = False
         for line in self.body:
@@ -1067,7 +1070,12 @@ class Premise:
             kept.append(line)
         while kept and kept[-1].strip() == "":
             kept.pop()
-        return len(kept), len("\n".join(kept).encode("utf-8"))
+        return "\n".join(kept)
+
+    def measured(self) -> tuple[int, int]:
+        """Body lines/bytes with the `**Why/Breaks/Tests/Depends on:**` blocks and trailing blanks removed."""
+        text = self.measured_text()
+        return len(text.split("\n")) if text else 0, len(text.encode("utf-8"))
 
     def tests_value(self) -> tuple[str, int] | None:
         for index, line in enumerate(self.body):
@@ -1632,6 +1640,87 @@ def check_c15(tree: Tree, docs: dict[str, Doc], out: list[Finding]) -> None:
             out.append(Finding(FAIL, "C15", path, 1, orphan))
 
 
+# ── near-duplicates: the merge queue (report, never a gate) ───────────────────────────────────────
+
+DUPLICATE_THRESHOLD = 0.8
+# Two premises can only be 80 % similar as sequences if they share most of their vocabulary, so the
+# cheap set comparison throws out ~all of the n² pairs before the expensive one runs. 0.4 is half the
+# body threshold: generous on purpose, since a prefilter that drops a real pair is a silent miss.
+DUPLICATE_PREFILTER = 0.4
+WORD_RE = re.compile(r"\w+")
+
+
+def word_set(text: str) -> frozenset:
+    return frozenset(WORD_RE.findall(text.lower()))
+
+
+def jaccard(left: frozenset, right: frozenset) -> float:
+    if not left or not right:
+        return 0.0
+    shared = len(left & right)
+    return shared / (len(left) + len(right) - shared)
+
+
+def premise_ref(item: Premise) -> dict:
+    return {"path": item.path, "title": item.title, "id": item.id}
+
+
+def near_duplicates(repo_dir: str, threshold: float = DUPLICATE_THRESHOLD,
+                    config: skills_config.Config | None = None) -> dict:
+    """Pairs of premises whose BODIES are near-identical — candidates to merge into one.
+
+    The comparator is the `difflib.SequenceMatcher(...).ratio()` C11/C12 already use to recognise a
+    renamed premise, so "near-duplicate" means one single thing in this toolkit. What it compares is
+    `measured_text()`, not the raw body: C11/C12 match a premise against its OWN former self, where the
+    shared field skeleton is harmless, while ACROSS premises that skeleton alone puts two unrelated
+    short ones over 0.8. This is a REPORT: it names pairs for a human to judge, it never fails a build.
+    """
+    repo = os.path.abspath(repo_dir)
+    config = config or skills_config.load(repo)
+    surfaces = Surfaces(config)
+    premises = collect_premises(parse_docs(Tree(repo, None, surfaces)), surfaces)
+    texts = [item.measured_text() for item in premises]
+    words = [word_set(text) for text in texts]
+    matcher = difflib.SequenceMatcher(None, autojunk=False)
+
+    pairs: list[dict] = []
+    for left in range(len(premises)):
+        matcher.set_seq2(texts[left])
+        for right in range(left + 1, len(premises)):
+            if jaccard(words[left], words[right]) < DUPLICATE_PREFILTER:
+                continue
+            matcher.set_seq1(texts[right])
+            # Both are cheap UPPER BOUNDS of ratio(): under the threshold they cannot reach it.
+            if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
+                continue
+            ratio = matcher.ratio()
+            if ratio >= threshold:
+                pairs.append({"ratio": round(ratio, 4), "a": premise_ref(premises[left]),
+                              "b": premise_ref(premises[right])})
+    pairs.sort(key=lambda item: (-item["ratio"], item["a"]["path"], item["a"]["title"]))
+    return {"threshold": threshold, "prefilter": DUPLICATE_PREFILTER, "premises": len(premises), "pairs": pairs}
+
+
+def render_near_duplicates(report: dict) -> str:
+    lines = [
+        "# Near-duplicate premises",
+        "",
+        "%d premise(s), threshold %.2f (Jaccard prefilter %.2f) — %d pair(s)."
+        % (report["premises"], report["threshold"], report["prefilter"], len(report["pairs"])),
+        "",
+    ]
+    if not report["pairs"]:
+        return "\n".join(lines + ["No pair over the threshold.", ""])
+    lines += ["| ratio | a | b |", "|---:|---|---|"]
+    for pair in report["pairs"]:
+        lines.append(
+            "| %.2f | `%s` › %s (`%s`) | `%s` › %s (`%s`) |"
+            % (pair["ratio"], pair["a"]["path"], pair["a"]["title"], pair["a"]["id"] or "—",
+               pair["b"]["path"], pair["b"]["title"], pair["b"]["id"] or "—")
+        )
+    return "\n".join(lines) + "\n"
+
+
 # ── driver ────────────────────────────────────────────────────────────────────────────────────────
 
 REF_CHECKS = (AnchorCheck(), LinkCheck(), BacktickPathCheck(), MigrationCheck(), SymbolCheck())
@@ -1693,8 +1782,25 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="regenerate every premises index and exit — the formatter to C15's format check",
     )
+    parser.add_argument(
+        "--near-duplicates",
+        action="store_true",
+        help="report premise pairs whose bodies are near-identical and exit 0 (never a gate)",
+    )
+    parser.add_argument("--threshold", type=float, default=DUPLICATE_THRESHOLD,
+                        help="similarity floor of --near-duplicates (default: %.1f)" % DUPLICATE_THRESHOLD)
+    parser.add_argument("--format", choices=("md", "json"), default="md",
+                        help="output format of --near-duplicates (default: md)")
     args = parser.parse_args(argv)
     config = skills_config.load(args.repo, args.config)
+
+    if args.near_duplicates:
+        report = near_duplicates(args.repo, args.threshold, config)
+        if args.format == "json":
+            print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            print(render_near_duplicates(report), end="")
+        return 0
 
     if args.write_indices:
         written = write_indices(args.repo, config)

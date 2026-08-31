@@ -350,6 +350,8 @@ class TimingTest(HookTestCase):
             ("charter", lambda: self.pre("Write", file_path=os.path.join(self.repo, ".claude/rules/n.md"))),
             ("query", lambda: self.pre("mcp__db__run_query", sql="select 1 from catalog_item")),
             ("gate-input", lambda: run_hook(self.repo, {"tool_input": {"command": GH_CREATE}}, argv=("gate-input",))),
+            ("commit-gate", lambda: run_hook(self.repo, {"tool_input": {"command": "git status"}},
+                                             argv=("commit-gate",))),
             ("read-1mb", lambda: run_hook(self.repo, big)),
         ]
         for name, call in paths:
@@ -455,7 +457,8 @@ def engage(repo: str, domain: str, minutes_ago: int = 0, session: str = "s1") ->
     os.utime(path, (stamp, stamp))
 
 
-def run_gate(repo: str, command: str, env=None, cwd=None, project_dir=True) -> Result:
+def run_gate(repo: str, command: str, env=None, cwd=None, project_dir=True, session=None,
+             payload_cwd=None) -> Result:
     environ = dict(os.environ)
     environ.pop("DEEP_PLAN_OVERRIDE", None)
     environ.pop("CONTEXT_HOOKS_DISABLE", None)
@@ -465,10 +468,15 @@ def run_gate(repo: str, command: str, env=None, cwd=None, project_dir=True) -> R
         environ.pop("CLAUDE_PROJECT_DIR", None)
     if env:
         environ.update(env)
+    data = {"tool_input": {"command": command}}
+    if session is not None:
+        data["session_id"] = session
+    if payload_cwd is not None:
+        data["cwd"] = payload_cwd
     start = time.time()
     proc = subprocess.run(
         ["bash", GATE],
-        input=json.dumps({"tool_input": {"command": command}}),
+        input=json.dumps(data),
         capture_output=True,
         text=True,
         cwd=cwd or repo,
@@ -655,6 +663,233 @@ class GateTest(unittest.TestCase):
         git(self.repo, "commit", "-qm", "contract")
         subdir = os.path.join(self.repo, "src")
         self.assertEqual(0, run_gate(self.repo, GH_CREATE, cwd=subdir, project_dir=False).code)
+
+
+# ── commit-trailers gate ──────────────────────────────────────────────────────────────────────────
+# The only hook here that BLOCKS. Every case below asserts the exact string the agent has to copy:
+# a remediation that has to be re-derived by the model defeats the point of deriving it from the log.
+
+SESSION = "s1"
+LOADS = ".claude/telemetry/loads-2026-08-28.jsonl"
+
+
+def load_line(session: str = SESSION, ts: str = "2026-08-28T10:00:00.000Z", **fields) -> dict:
+    line = {"session_id": session, "ts": ts, "path": None, "premise_id": None, "premise": None, "read": None}
+    line.update(fields)
+    return line
+
+
+def write_loads(repo: str, lines: list) -> None:
+    write(repo, LOADS, "".join(json.dumps(line) + "\n" for line in lines))
+
+
+def write_sentinel(repo: str, head: str, ts: str, session: str = SESSION) -> None:
+    write(repo, ".claude/telemetry/session-%s.head" % session, json.dumps({"head": head, "ts": ts}))
+
+
+def run_commit_gate(repo: str, command: str, session=SESSION, env=None) -> Result:
+    data = {"tool_input": {"command": command}}
+    if session is not None:
+        data["session_id"] = session
+    return run_hook(repo, data, env=env, argv=("commit-gate",))
+
+
+class CommitGateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repo = new_repo()
+        self.addCleanup(shutil.rmtree, self.repo, True)
+
+    def sentinel(self, session: str = SESSION) -> dict:
+        with open(os.path.join(self.repo, ".claude/telemetry/session-%s.head" % session), encoding="utf-8") as h:
+            return json.load(h)
+
+    def two_fetches(self) -> None:
+        write_loads(
+            self.repo,
+            [
+                load_line(ts="2026-08-28T10:00:00.000Z", read="fetch", premise_id="p-bbbbbbbb"),
+                load_line(ts="2026-08-28T11:00:00.000Z", read="fetch", premise_id="p-aaaaaaaa"),
+                load_line(ts="2026-08-28T11:30:00.000Z", session="other", read="fetch", premise_id="p-cccccccc"),
+            ],
+        )
+
+    def test_commit_without_trailers_is_blocked_with_the_exact_remediation(self) -> None:
+        self.two_fetches()
+        result = run_commit_gate(self.repo, 'git commit -m "feat: x"')
+        self.assertEqual(2, result.code)
+        self.assertIn('--trailer "Premises-Read: p-aaaaaaaa, p-bbbbbbbb"', result.stderr)
+        self.assertIn('--trailer "Agent-Session: s1"', result.stderr)
+        self.assertNotIn("p-cccccccc", result.stderr)  # another session's reads are not this window
+        self.assertIn("CONTEXT_HOOKS_DISABLE=trailers", result.stderr)
+
+    def test_commit_carrying_the_trailers_passes(self) -> None:
+        self.two_fetches()
+        command = (
+            'git commit -m "feat: x" --trailer "Premises-Read: p-aaaaaaaa, p-bbbbbbbb"'
+            ' --trailer "Agent-Session: s1"'
+        )
+        self.assertEqual(0, run_commit_gate(self.repo, command).code)
+
+    def test_a_partially_annotated_commit_only_asks_for_what_is_missing(self) -> None:
+        self.two_fetches()
+        result = run_commit_gate(self.repo, 'git commit -m "x" --trailer "Agent-Session: s1"')
+        self.assertEqual(2, result.code)
+        asked = [line.strip() for line in result.stderr.splitlines() if line.startswith("  --trailer")]
+        self.assertEqual(['--trailer "Premises-Read: p-aaaaaaaa, p-bbbbbbbb"'], asked)
+
+    def test_loads_before_the_sentinel_are_out_of_the_window(self) -> None:
+        self.two_fetches()
+        write_sentinel(self.repo, "deadbeef", "2026-08-28T10:30:00.000Z")
+        result = run_commit_gate(self.repo, "git commit -m x")
+        self.assertIn('--trailer "Premises-Read: p-aaaaaaaa"', result.stderr)
+        self.assertNotIn("p-bbbbbbbb", result.stderr)
+
+    def test_whole_file_read_becomes_the_files_trailer(self) -> None:
+        write_loads(self.repo, [load_line(read="whole", path="docs/catalog/premises.md")])
+        result = run_commit_gate(self.repo, "git commit -m x")
+        self.assertIn('--trailer "Premises-Files-Read: docs/catalog/premises.md"', result.stderr)
+        self.assertNotIn("Premises-Read:", result.stderr)
+
+    def test_more_than_forty_ids_degrade_to_the_file(self) -> None:
+        lines = [
+            load_line(read="fetch", premise_id="p-%08x" % index, path="docs/shipping/premises.md")
+            for index in range(41)
+        ]
+        write_loads(self.repo, lines)
+        result = run_commit_gate(self.repo, "git commit -m x")
+        read_line = [ln for ln in result.stderr.splitlines() if "Premises-Read:" in ln][0]
+        self.assertEqual(40, read_line.count("p-"))
+        self.assertIn('--trailer "Premises-Files-Read: docs/shipping/premises.md"', result.stderr)
+
+    def test_without_a_load_log_only_the_session_trailer_is_required(self) -> None:
+        result = run_commit_gate(self.repo, "git commit -m x")
+        self.assertEqual(2, result.code)
+        self.assertNotIn("Premises-Read", result.stderr)
+        self.assertEqual(0, run_commit_gate(self.repo, 'git commit -m x --trailer "Agent-Session: s1"').code)
+
+    def test_two_sessions_do_not_share_a_window(self) -> None:
+        self.two_fetches()
+        result = run_commit_gate(self.repo, "git commit -m x", session="other")
+        self.assertIn('--trailer "Premises-Read: p-cccccccc"', result.stderr)
+        self.assertIn('--trailer "Agent-Session: other"', result.stderr)
+
+    # ── what is NOT a commit ──────────────────────────────────────────────────────────────────────
+
+    def test_echo_of_a_git_commit_does_not_block(self) -> None:
+        self.assertEqual(0, run_commit_gate(self.repo, 'echo "git commit -m x"').code)
+
+    def test_heredoc_body_naming_a_commit_does_not_block(self) -> None:
+        command = "gh pr comment 1 --body \"$(cat <<'EOF'\ngit commit -m x\nEOF\n)\""
+        self.assertEqual(0, run_commit_gate(self.repo, command).code)
+
+    def test_amend_fixup_and_reuse_pass(self) -> None:
+        # Both spellings of each reuse flag: `-C`/`--reuse-message` and `-c`/`--reedit-message`.
+        for command in (
+            "git commit --amend --no-edit",
+            "git commit --fixup=HEAD",
+            "git commit --squash HEAD",
+            "git commit -C HEAD",
+            "git commit --reuse-message=HEAD",
+            "git commit -c HEAD",
+            "git commit --reedit-message=HEAD",
+        ):
+            self.assertEqual(0, run_commit_gate(self.repo, command).code, command)
+
+    def test_merge_and_revert_pass(self) -> None:
+        self.assertEqual(0, run_commit_gate(self.repo, "git merge origin/main").code)
+        self.assertEqual(0, run_commit_gate(self.repo, "git revert --no-edit HEAD").code)
+
+    def test_wrappers_and_chaining_do_not_hide_the_commit(self) -> None:
+        for command in ("nohup git commit -m x", "git add -A && git commit -m x", 'bash -c "git commit -m x"'):
+            self.assertEqual(2, run_commit_gate(self.repo, command).code, command)
+
+    # ── escapes and fail-open ─────────────────────────────────────────────────────────────────────
+
+    def test_disable_trailers_allows_and_audits(self) -> None:
+        result = run_commit_gate(self.repo, "git commit -m x", env={"CONTEXT_HOOKS_DISABLE": "trailers"})
+        self.assertEqual(0, result.code)
+        self.assertIn("disabled via CONTEXT_HOOKS_DISABLE", result.stderr)
+
+    def test_missing_session_id_and_malformed_payload_are_fail_open(self) -> None:
+        self.assertEqual(0, run_commit_gate(self.repo, "git commit -m x", session=None).code)
+        self.assertEqual(0, run_hook(self.repo, "not json", argv=("commit-gate",)).code)
+
+    def test_unreadable_load_line_does_not_break_the_gate(self) -> None:
+        write(self.repo, LOADS, "{not json\n" + json.dumps(load_line(read="fetch", premise_id="p-aaaaaaaa")) + "\n")
+        result = run_commit_gate(self.repo, "git commit -m x")
+        self.assertEqual(2, result.code)
+        self.assertIn('--trailer "Premises-Read: p-aaaaaaaa"', result.stderr)
+
+    # ── the sentinel, written after the commit lands ──────────────────────────────────────────────
+
+    def test_post_tool_writes_the_sentinel_only_when_head_moved(self) -> None:
+        data = payload("PostToolUse", self.repo, SESSION, tool_name="Bash", tool_input={"command": "git commit -m x"})
+        run_hook(self.repo, data)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True
+        ).stdout.strip()
+        self.assertEqual(head, self.sentinel()["head"])
+        first = self.sentinel()["ts"]
+        run_hook(self.repo, data)
+        self.assertEqual(first, self.sentinel()["ts"])  # HEAD did not move: the window is unchanged
+        write(self.repo, "b.md", "b\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "second")
+        run_hook(self.repo, data)
+        self.assertNotEqual(head, self.sentinel()["head"])
+
+    def test_post_tool_of_a_non_commit_writes_no_sentinel(self) -> None:
+        data = payload("PostToolUse", self.repo, SESSION, tool_name="Bash", tool_input={"command": "git status"})
+        run_hook(self.repo, data)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude/telemetry")))
+
+    # ── which checkout the gates measure ──────────────────────────────────────────────────────────
+    # An agent isolated in a git worktree keeps the mother session's CLAUDE_PROJECT_DIR, so a gate
+    # that trusts the variable reads the WRONG repo: the load log, the sentinel and the branch diff
+    # all come from a checkout the command never touched.
+
+    def other_repo(self) -> str:
+        other = new_repo()
+        self.addCleanup(shutil.rmtree, other, True)
+        return other
+
+    def test_the_payload_cwd_wins_over_the_session_project_dir(self) -> None:
+        other = self.other_repo()
+        write_loads(self.repo, [load_line(read="fetch", premise_id="p-aaaaaaaa")])
+        write_loads(other, [load_line(read="fetch", premise_id="p-bbbbbbbb")])
+        data = {"session_id": SESSION, "cwd": other, "tool_input": {"command": "git commit -m x"}}
+        result = run_hook(self.repo, data, argv=("commit-gate",))
+        self.assertIn('--trailer "Premises-Read: p-bbbbbbbb"', result.stderr)
+        self.assertNotIn("p-aaaaaaaa", result.stderr)
+
+    def test_gate_input_prints_the_payload_root(self) -> None:
+        data = {"cwd": self.repo, "tool_input": {"command": GH_CREATE}}
+        lines = run_hook(self.repo, data, argv=("gate-input",)).stdout.splitlines()
+        self.assertEqual(os.path.realpath(self.repo), lines[2])
+        no_cwd = run_hook(self.repo, {"tool_input": {"command": GH_CREATE}}, argv=("gate-input",))
+        self.assertEqual("", no_cwd.stdout.splitlines()[2])
+
+    def test_shell_gate_measures_the_repo_of_the_payload_cwd(self) -> None:
+        other = self.other_repo()
+        sensitive_change(other)  # the sensitive diff lives in `other`; CLAUDE_PROJECT_DIR points here
+        result = run_gate(self.repo, GH_CREATE, session=SESSION, payload_cwd=other)
+        self.assertEqual(2, result.code)
+        self.assertIn("docs/catalog/premises-index.md", result.stderr)
+
+    # ── section 0 of deep-plan-pr-gate.sh ─────────────────────────────────────────────────────────
+
+    def test_shell_gate_section_zero_blocks_the_commit(self) -> None:
+        result = run_gate(self.repo, 'git commit -m "x"', session=SESSION)
+        self.assertEqual(2, result.code)
+        self.assertIn('--trailer "Agent-Session: s1"', result.stderr)
+
+    def test_shell_gate_lets_the_annotated_commit_through(self) -> None:
+        result = run_gate(self.repo, 'git commit -m x --trailer "Agent-Session: s1"', session=SESSION)
+        self.assertEqual(0, result.code)
+
+    def test_deep_plan_override_does_not_disable_the_commit_gate(self) -> None:
+        result = run_gate(self.repo, "git commit -m x", session=SESSION, env={"DEEP_PLAN_OVERRIDE": "x"})
+        self.assertEqual(2, result.code)
 
 
 if __name__ == "__main__":

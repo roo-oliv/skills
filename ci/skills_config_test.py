@@ -98,6 +98,11 @@ class TemplateTest(unittest.TestCase):
         self.assertIsNone(self.config.schema)
         self.assertEqual(skills_config.CEILINGS, self.config.ceilings)
 
+    def test_lane_a_is_the_default_and_lane_b_is_off(self) -> None:
+        self.assertEqual("git-only", self.config.telemetry_lanes)
+        self.assertFalse(self.config.otlp_enabled)
+        self.assertEqual("main", self.config.default_branch)
+
     def test_the_stack_specific_checks_stay_off(self) -> None:
         self.assertEqual([], self.config.source_globs)
         self.assertEqual([], self.config.migration_dirs)
@@ -175,6 +180,47 @@ class FilledTest(unittest.TestCase):
             self.config.premises_index_for("docs/domain/catalog/premises-pricing.md"),
         )
         self.assertEqual("docs/schema/catalog.md", self.config.schema_of_domain("catalog"))
+
+
+class TelemetryLaneTest(unittest.TestCase):
+    """`## Telemetry` › `Lanes` decides whether lane B (OTLP) is wired at all."""
+
+    @staticmethod
+    def lanes(section_body: str) -> skills_config.Config:
+        directory = tempfile.mkdtemp(prefix="skills-config-lanes-")
+        path = os.path.join(directory, "config.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("# config\n\n## Telemetry\n\n" + section_body)
+        try:
+            return skills_config.load(directory, path)
+        finally:
+            shutil.rmtree(directory, True)
+
+    def test_an_explicit_lane_is_taken_as_written(self) -> None:
+        for value, enabled in (("git-only", False), ("otlp", True), ("both", True)):
+            config = self.lanes(f"- **Lanes:** `{value}`\n")
+            self.assertEqual(value, config.telemetry_lanes)
+            self.assertEqual(enabled, config.otlp_enabled)
+
+    def test_an_unknown_lane_keeps_the_default_and_says_so(self) -> None:
+        config = self.lanes("- **Lanes:** `datadog`\n")
+        self.assertEqual("git-only", config.telemetry_lanes)
+        self.assertTrue(any("Lanes" in note for note in config.notes), config.notes)
+
+    def test_a_config_that_predates_the_field_but_names_an_endpoint_keeps_lane_b(self) -> None:
+        # The regression this guards: a repo that configured OTLP before `Lanes` existed must not have
+        # its export silently switched off by the new default.
+        config = self.lanes("- **Endpoint:** `https://otlp.example.com`\n")
+        self.assertEqual("both", config.telemetry_lanes)
+        self.assertTrue(config.otlp_enabled)
+        self.assertEqual("both", self.lanes("- **Key variable:** `MY_KEY`\n").telemetry_lanes)
+
+    def test_an_explicit_git_only_wins_over_a_leftover_endpoint(self) -> None:
+        config = self.lanes("- **Lanes:** `git-only`\n- **Endpoint:** `https://otlp.example.com`\n")
+        self.assertFalse(config.otlp_enabled)
+
+    def test_the_branch_the_trailer_miner_reads_comes_from_the_config(self) -> None:
+        self.assertEqual("trunk", self.lanes("- **Default branch:** `trunk`\n").default_branch)
 
 
 class MissingConfigTest(unittest.TestCase):
