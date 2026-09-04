@@ -77,14 +77,6 @@ as you attack — a matched entry is a known hole worth probing first.
 Default to **refuted when uncertain** — a flagged false-positive costs a re-check;
 a missed gap ships. Bias toward finding the hole.
 
-**Targeted mode (resolution re-refute).** When the engine assigns you an explicit
-scope — the final refute round's resolutions, listed in your prompt — attack ONLY
-those resolutions and the cells/rows/dimension entries they touched. "All four
-surfaces against every cell/row" does not apply; out-of-scope refutations are
-discarded by the engine. The four surfaces still frame *how* you attack each
-listed resolution (does the cited handling exist? is the base/cap right? does the
-precondition hold? does an async transition reopen it?).
-
 ## Output
 
 When the Workflow supplies a `RefutationVerdict` schema, emit it. Standalone:
@@ -111,7 +103,25 @@ planner tells fix-attack equilibrium apart from undiscovered surface.
   matrix column — add it.
 ```
 
-Every refutation reopens a cell/row for the owning analyst and triggers another
-refute round. The loop ends only when a full round surfaces nothing new. If you
-genuinely cannot break anything after a real attempt, say so — but only after
-attempting all four surfaces against every cell/row.
+## Your patch
+
+You hold the evidence, so **you** write the reopening: return it as `patch`
+(schema `DraftPatch`). **Reopen only** — never propose a fix, never relabel a
+`GAP` as `handled`, and never resolve a dimension violation.
+
+- Every cell you refute → `cellsUpsert` with verdict `GAP` + justification.
+- A missing column/state → `columnsAdd`/`statesAdd` **and** `cellsUpsert` for
+  every existing state × that column (handled / N·A / GAP, each with evidence).
+- A dimension attack → `violationsAdd`, plus the corrected row in
+  `dimensionRowsUpsert` when you have it.
+- A precondition shown false → `preconditionUpsert` (`guard` verbatim).
+- A commitment the contract is missing → `contractAdd`.
+
+Reference every **existing** cell by its axis labels exactly as printed in the
+draft — the leading `S#`/`C#` code alone is enough, and a paraphrase mints a
+phantom axis. A column/state you *add* needs no code; the engine assigns one.
+
+Your patch is merged conservatively with the other refuters' patches — on a
+collision `GAP` wins, so nobody can bury your reopening — and there is one breadth
+round by default. If you genuinely cannot break anything after a real attempt, say
+so — but only after attempting all four surfaces against every cell/row.

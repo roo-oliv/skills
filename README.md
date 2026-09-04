@@ -41,6 +41,7 @@ same config.
 |---|---|---|
 | **Context** | `ci/context_lint.py` (CI gate: ceilings, frontmatter, every reference that must resolve; `--near-duplicates` reports premises to merge), `ci/premise.py` (read ONE premise by stable id, or resolve a title to its id), `ci/context_decay.py` (monthly: what stopped describing anything alive), `hooks/context_hooks.py` (puts a domain's premises index on the *reasoning* path, and gates the premise trailers on every session commit), `hooks/deep-plan-pr-gate.sh`, `rules/context.md`, `rules/premises.md` | [`docs/context-toolkit.md`](docs/context-toolkit.md) |
 | **Telemetry** | two lanes. **A, git-only (default):** `ci/agent_telemetry.py` — which surface loaded and why, plus `commits`, which mines the premise trailers out of the branch log and the open PRs into a read x violated matrix. **B, OTLP (optional):** `ci/otel_headers.py` (auth header from a repo variable), `settings/env.json` | [`docs/telemetry.md`](docs/telemetry.md) |
+| **Workflow measurement** | `ci/wf_timeline.py` — per-agent and per-stage wall-clock, turns and tokens of a `deep-plan` / `implement` run, read off its journal; `--stages` prints each stage's window so real parallelism is visible. Per-skill cost telemetry cannot see Workflow subagents | [`docs/workflow-calibration.md`](docs/workflow-calibration.md) |
 | **Lint ratchet** | `ci/lint_ratchet.py` (`config-rides-alone`, `cpd-delta`), `ci/refactor_ratio.py` + its workflow example | [`docs/lint-ratchet.md`](docs/lint-ratchet.md) |
 
 ## How portability works
@@ -101,7 +102,7 @@ ci/workflows/               # workflow examples to copy, not installed
 rules/*.md                  # conventions vendored to .claude/rules/
 settings/*.json             # settings.json fragments the installer MERGES
 hooks/                      # context hooks + the PR-create gate
-docs/                       # this repo's own docs: context toolkit, telemetry, lint ratchet
+docs/                       # this repo's own docs: context toolkit, telemetry, lint ratchet, workflow calibration
 scripts/install.sh          # vendors all of the above into a target repo
 ```
 
@@ -132,7 +133,9 @@ a model of a given generation did not do on its own. The load-bearing ones:
   loses its tail, and nobody notices.
 - **Re-audit the harness on every model upgrade.** Each constant was calibrated against a model that
   no longer exists after an upgrade. Re-run a baseline set of PRs, compare cost per PR and valid
-  findings, and update the numbers — which is what the telemetry above is for.
+  findings, and update the numbers — which is what the telemetry above is for. The reasoning behind
+  each workflow constant, the per-role model tables and the audit log live in
+  [`docs/workflow-calibration.md`](docs/workflow-calibration.md).
 
 ## Gotchas
 

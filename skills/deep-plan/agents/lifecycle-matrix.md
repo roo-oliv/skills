@@ -28,9 +28,20 @@ that relaxes only between creation and first payment (originals SUPERSEDED,
 excluded from the sum). Your entity's stages will differ; the cell-filling
 discipline below is the same.
 
-## Your unique job — answer every cell
+## Your unique job — answer every cell of YOUR slice
 
-For **each new state (row) × each column** from Agent 2, walk the lifecycle and
+You get **one slice of the matrix**, not the whole grid: a batch of states and all
+their columns (the rows), a batch of columns and all their states (gate mode), or
+an explicit list of (state × column) pairs (the targeted fill). Answer **every
+cell of that slice** — no other agent covers it — and nothing outside it. Every
+field ≤ 240 chars.
+
+Each axis label you are handed begins with a **code** (`S3 …`, `C12 …`). Write
+each cell's `state` and `column` **exactly as listed** — the leading code alone is
+enough. Never paraphrase a label: a paraphrase mints a phantom axis, and the cell
+you answered lands on a row nobody asked for.
+
+For **each state (row) × each column** of your slice, walk the lifecycle and
 answer:
 
 - `handled` — the intent explicitly accounts for this interaction. **Say where**
@@ -71,7 +82,10 @@ filter returns empty. These ordering bugs are the most dangerous; mark the cell
 
 Cross-check the repo's **recurring-failure-modes** doc (config › Docs layout ›
 Planning) for every cell — apply each entry whose trigger matches an
-interaction in this row.
+interaction in this row. A **mutator** column (one that WRITES the affected
+state, not just reads it) is answered like any other: `handled` only when the
+write is guarded — name the guard — otherwise `N/A` with the reason it cannot
+fire, or `GAP`.
 
 ## Output
 
@@ -81,7 +95,7 @@ Standalone:
 ```markdown
 # Agent 4 — Interaction-matrix cells
 
-## Filled matrix
+## Filled slice (your rows, your columns, or your listed pairs)
 | state \ column | <col 1> | <col 2> | <col 3> | ... |
 |---|---|---|---|---|
 | <new state> | handled (step 4 of intent) | GAP (ordering: superseded before refund) | N/A (no settlement yet) | ... |
@@ -90,5 +104,6 @@ Standalone:
 - **<state> × <column>** — <why unresolved / what breaks> — *resolution needed:* <terse>
 ```
 
-Every cell must be answered. An empty or unjustified-`GAP` cell fails the Gate.
-If the intent adds no new state/lifecycle, return `_No new state/lifecycle — N/A._`.
+Every cell **of your slice** must be answered — an empty or unjustified-`GAP`
+cell in it fails the Gate, and it is your slice alone. If the intent adds no new
+state/lifecycle, return `_No new state/lifecycle — N/A._`.

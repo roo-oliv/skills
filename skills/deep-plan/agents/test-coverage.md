@@ -74,6 +74,19 @@ a contract line: "update X in the same PR."
 Cross-check the repo's **recurring-failure-modes** doc — every matched entry
 names an executable premise that should exist.
 
+## Part D — Contract block
+
+Derive Artifact 1 of the plan-contract spec (config › Docs layout › Planning)
+from the intent: the atomic, individually verifiable commitments — wiring points
+and their counts, predicates, invariants, exact values, files. *If confirming it
+happened would need a grep, it belongs here.* One line each, ≤ 280 chars, into the
+`contract` field. Do **not** restate your Part-A tests there: the engine folds
+every failing-first obligation into the same block deterministically.
+
+You need only the intent for this, so it costs nothing extra — and it is the
+reason the Contract no longer waits on a downstream fill agent that used to drop
+items while retyping them.
+
 ## Output
 
 When the Workflow supplies a `PremiseObligations` schema, emit it. Standalone:
@@ -93,6 +106,9 @@ When the Workflow supplies a `PremiseObligations` schema, emit it. Standalone:
 
 ## Doc / premise drift (update in same PR)
 - `<premises doc>` — premise "<title>" invalidated by <change>.
+
+## Contract
+1. <atomic, greppable commitment — wiring point / predicate / exact value / file>
 ```
 
 If the intent introduces/depends on no invariant, say so — but for a

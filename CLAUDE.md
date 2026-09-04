@@ -59,7 +59,9 @@ file runs on a Kotlin backend, a TS app, and a C# game engine.
   consumer's `.claude/settings.json`, and the consumer's own value always wins. Keep each fragment to one
   concern (`hooks.json`, `env.json`) and never write a key the consumer would want to own without knowing.
 - What each toolkit does and why: [`docs/context-toolkit.md`](docs/context-toolkit.md),
-  [`docs/telemetry.md`](docs/telemetry.md), [`docs/lint-ratchet.md`](docs/lint-ratchet.md).
+  [`docs/telemetry.md`](docs/telemetry.md), [`docs/lint-ratchet.md`](docs/lint-ratchet.md). Why every
+  workflow constant and per-role model is what it is — plus the audit log a model upgrade appends to:
+  [`docs/workflow-calibration.md`](docs/workflow-calibration.md).
 
 ## When you add or rename a skill
 
