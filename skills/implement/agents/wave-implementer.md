@@ -40,13 +40,30 @@ If your wave creates a **derived** load-bearing quantity that the plan/contract 
 
 A whole cluster of review findings can grow from a single quantity minted without this row.
 
-## Context hygiene
+## Context hygiene — mechanical rules
 
-You have a finite context budget and the wave must fit in it. Delegate to subagents (`Explore` for broad searches, `general-purpose` for closed sub-tasks) anything that inflates your context without needing to stay in it: caller sweeps, reading large files you only need a conclusion from, running long test suites whose output you only need summarized. Use `rg` (never `grep -r`), scoped to the repo. Don't read `/tmp`, `~`, or sibling worktrees.
+Context is the scarce resource of a wave: measured across real runs, the model is 70–90% of a wave's wall-clock and hundreds of KB of whole-file reads go into a single wave. These are not suggestions.
+
+- **Never** dump a file over ~200 lines: locate the point with `rg -n '<symbol>' <file>` and read only that range (`Read` with offset/limit, or `sed -n '120,180p' <file>`).
+- A caller/usage sweep goes to an `Explore` subagent, which returns the **conclusion**, not the files; a long closed sub-task goes to `general-purpose`.
+- Every build/test command ends in `2>&1 | tail -40`, or `> /tmp/<step>.log 2>&1` followed by an `rg -n` for the failure markers in that log.
+- A pointed change is an `Edit`. Never rewrite a whole file through a heredoc when one substitution does it.
+- `rg`, never `grep -r`, scoped to the repo. Don't read `~`, sibling worktrees, or anything under `/tmp` that isn't your own log.
+
+## Continuation (`partial`)
+
+Past ~120 tool calls, or with context already heavy, or when the wave's items plainly do not fit one agent: **stop and ship what is green** instead of continuing degraded.
+
+1. Incremental verify + commit + push of what already works.
+2. Ledger: what closed (with SHAs), what is left, and the handoff for the continuation agent.
+3. Return `status: partial` with `remaining { goal, contractItems, files }` for what is left, and `testEvidence` for the items you closed. `untestedItems` stays empty — it speaks about the items you declared closed; the ones you hand on are in `remaining`.
+
+The orchestrator queues the continuation with a fresh agent. `partial` is not a failure; a degraded agent pushing to the end is.
 
 ## Structured output (schema in the prompt)
 
-- `status`: `done` | `blocked`
+- `status`: `done` | `partial` | `blocked`
+- `remaining`: `{ goal, contractItems[], files[] }` — required on `partial`, ignored otherwise
 - `commitShas`: committed SHAs (empty if blocked before committing)
 - `decisions`: list of `{ point, options, chosen, why }` (telegraphic, ≤240 chars per field)
 - `testEvidence`: list of `{ item, tests[], na }` — named test(s) per wave contract item, or `na` justification

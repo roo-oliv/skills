@@ -4,9 +4,9 @@ export const meta = {
   whenToUse: 'Invoked by the /implement skill (.claude/skills/implement/SKILL.md) with an APPROVED plan. Do not invoke without a plan that has a Contract block.',
   phases: [
     { title: 'Setup', detail: 'validates branch, seeds/resumes ledger, splits the plan into waves, commits the deep-plan contract if present' },
-    { title: 'Implement', detail: 'one wave at a time: fresh agent implements, incremental verify, commit, push, ledger' },
-    { title: 'Verify', detail: 'full verify with fix loop (≤3) + verify-plan reconciliation + 1 fix round' },
-    { title: 'PR', detail: 'rebase onto origin/<base>, push, gh pr create with an extensive body in the repo PR language' },
+    { title: 'Implement', detail: 'a queue of waves: fresh agent implements, incremental verify, commit, push, ledger; a partial wave enqueues its continuation' },
+    { title: 'Verify', detail: 'verify ∥ verify-plan; recon-fix; one final full build ∥ the recheck' },
+    { title: 'PR', detail: 'merge origin/<base> (never rebase), build only if the merge brought commits, gh pr create with an extensive body in the repo PR language' },
   ],
 }
 
@@ -23,6 +23,9 @@ if (missingArgs.length) {
 
 const BASE = ARGS.baseBranch || 'main'
 const MAX_WAVES = Math.min(ARGS.maxWaves || 8, 12)
+// Planned waves + slack for continuations (a wave that returns `partial`). A run cannot spin
+// forever: past this many EXECUTED waves the queue is abandoned with what is committed.
+const MAX_WAVE_RUNS = MAX_WAVES + 3
 const ROLE_DIR = `${ARGS.repoRoot}/.claude/skills/implement/agents`
 const CONFIG = 'docs/agents/skills-config.md'
 
@@ -48,9 +51,9 @@ const t = (name, effort) => ({ ...TIERS[name], ...(effort ? { effort } : {}) })
 const ROLE = {
   setup: t('worker'), // plan → waves
   wave: t('decision'), // wave-N (+retry) · recon-fix
-  verify: t('decision', 'medium'), // verify-N
+  verify: t('decision', 'medium'), // verify-N · verify-final
   verifyPlan: t('decision'), // verify-plan (+recheck) — reconciles what another agent wrote
-  prAuthor: t('pr-author'), // pr-author (ledger → PR body, rebase, push)
+  prAuthor: t('pr-author'), // pr-author (ledger → PR body, merge of the base, push)
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +85,7 @@ const SETUP_RESULT = {
         type: 'object',
         required: ['id', 'title', 'goal'],
         properties: {
-          id: { type: 'integer' },
+          id: { type: 'string', description: 'the wave number; a continuation of wave N is N.1, N.2, …' },
           title: { type: 'string', maxLength: 80 },
           goal: { type: 'string', maxLength: 400 },
           contractItems: { type: 'array', items: { type: 'string', maxLength: 200 }, maxItems: 15 },
@@ -101,7 +104,17 @@ const WAVE_RESULT = {
   type: 'object',
   required: ['status', 'untestedItems'],
   properties: {
-    status: { type: 'string', enum: ['done', 'blocked'] },
+    status: { type: 'string', enum: ['done', 'blocked', 'partial'] },
+    remaining: {
+      type: 'object',
+      required: ['goal', 'contractItems'],
+      description: 'required when status=partial: what is left of the wave, for the continuation agent',
+      properties: {
+        goal: { type: 'string', maxLength: 400 },
+        contractItems: { type: 'array', items: { type: 'string', maxLength: 200 }, maxItems: 15 },
+        files: { type: 'array', items: { type: 'string', maxLength: 200 }, maxItems: 20 },
+      },
+    },
     commitShas: { type: 'array', items: { type: 'string', maxLength: 40 }, maxItems: 10 },
     decisions: { type: 'array', items: DECISION, maxItems: 10 },
     testEvidence: {
@@ -144,7 +157,7 @@ const PR_RESULT = {
     status: { type: 'string', enum: ['pr-opened', 'blocked', 'blocked-gate'] },
     prNumber: { type: 'integer' },
     prUrl: { type: 'string', maxLength: 200 },
-    rebased: { type: 'boolean', description: 'true if the rebase brought new commits from the base' },
+    mergedMain: { type: 'boolean', description: 'true if merging the base brought new commits' },
     blockedReason: { type: 'string', maxLength: 600 },
   },
 }
@@ -153,19 +166,22 @@ const PR_RESULT = {
 // Prompt helpers
 // ---------------------------------------------------------------------------
 
-function ctx() {
+// The first line marks the role: it is what ci/wf_timeline.py keys on to attribute a stage's
+// turns and tokens. It must stay line 1 of every prompt this script builds.
+function ctx(label) {
   return [
+    `[implement role: ${label}]`,
     `Repo: ${ARGS.repoRoot} (work ONLY inside it; use rg, never grep -r; do not read /tmp, ~, or sibling worktrees).`,
     `Read ${CONFIG} for this repo's stack-specific inputs (Verify command, Sensitive domains, Docs layout, Conventions). If a section is absent, fall back to the stated default and say so.`,
     `Working branch: ${ARGS.branch} (base: origin/${BASE}). Mandatory guard: git branch --show-current must return exactly this; if it diverges, return blocked immediately.`,
-    `Push authorized ONLY via "git push origin ${ARGS.branch}". Never force (except --force-with-lease post-rebase, PR author only), never ${BASE}.`,
+    `Push authorized ONLY via "git push origin ${ARGS.branch}". Never force (not even --force-with-lease), never ${BASE}.`,
     `Approved plan: ${ARGS.planPath}. Ledger: ${ARGS.ledgerPath} (gitignored — lives in .claude/.implement/, outside versioning; NEVER commit it).`,
     `Your final text is parsed as structured data by the orchestrator — follow the schema, no extra prose.`,
   ].join('\n')
 }
 
 function setupPrompt() {
-  return `${ctx()}
+  return `${ctx('setup')}
 
 You are the SETUP agent of the /implement workflow.
 
@@ -175,14 +191,14 @@ You are the SETUP agent of the /implement workflow.
    - plan: ${ARGS.planPath} | branch: ${ARGS.branch} | started: ${ARGS.timestamp}
    - sections "## Directives (from the user)" (empty if none), "## Waves" (checklist), "## Decisions", "## Handoffs".
 4. ${ARGS.deepPlanContractPath ? `Deep-plan contract: ${ARGS.deepPlanContractPath}. If not yet committed on the branch under .claude/deep-plan/, copy it there (name <branch-with-/-as-->-<shortSha>.md), git add + commit (a chore commit adding the deep-plan plan-contract, per the repo's commit conventions in ${CONFIG} › Conventions) + push. It is the artifact the PR gate hook reads on a sensitive-domain branch.` : 'No deep-plan contract to commit.'}
-5. Split the plan into AT MOST ${MAX_WAVES} PENDING waves, in dependency order: by the plan's phase structure if it has one, otherwise by logical commit groups (schema/migration + entity → service/logic → wiring/listeners → tests — adapt to the plan and to the repo's commit conventions). Each wave: id, title, goal (what will be true at the end), contractItems (numbers/text from the Contract it covers — EVERY Contract item must belong to exactly one wave), files (initial guess). Waves small enough for a fresh agent to finish without blowing context (~≤8 new/changed files per wave as a rule of thumb).
+5. Split the plan into AT MOST ${MAX_WAVES} PENDING waves, in dependency order: by the plan's phase structure if it has one, otherwise by logical commit groups (schema/migration + entity → service/logic → wiring/listeners → tests — adapt to the plan and to the repo's commit conventions). Each wave: id, title, goal (what will be true at the end), contractItems (numbers/text from the Contract it covers — EVERY Contract item must belong to exactly one wave), files (initial guess). Waves small enough for a fresh agent to finish without blowing context — ruler: **≤ 6 contract items and ≤ 8 new/changed files per wave**; above that, split. An over-large wave degrades the agent (a measured one reached 199 turns) and the continuation mechanism (\`partial\`) is the valve, not the plan.
 6. Record the wave split in the ledger.
 
 If anything blocks (wrong branch, plan with no Contract, dirty tree), return branchOk=false/blockedReason. Also suggest the prTitle (per the repo's commit conventions in ${CONFIG} › Conventions)${ARGS.prTitleHint ? ` — user hint: "${ARGS.prTitleHint}"` : ''}.`
 }
 
 function wavePrompt(wave, retryReason) {
-  return `${ctx()}
+  return `${ctx(`wave-${wave.id}${retryReason ? '-retry' : ''}`)}
 
 Read ${ROLE_DIR}/wave-implementer.md and operate as that agent.
 
@@ -191,10 +207,10 @@ ${JSON.stringify(wave, null, 2)}
 ${retryReason ? `\nRETRY: the previous attempt of this wave failed with: "${retryReason}". Read the ledger and git log to see what it left half-done before continuing — there may be uncommitted or partially committed work.` : ''}`
 }
 
-function verifyPrompt(attempt, previousFailing) {
-  return `${ctx()}
+function verifyPrompt(label, attemptLabel, previousFailing) {
+  return `${ctx(label)}
 
-You are the VERIFY agent (attempt ${attempt} of 3) of the /implement workflow. All waves have committed; your job is to leave the whole build green.
+You are the VERIFY agent (${attemptLabel}) of the /implement workflow. All waves have committed; your job is to leave the whole build green.
 
 Run the repo's FULL Verify command (${CONFIG} › Verify): format → lint → tests targeted at the branch diff (git diff --name-only origin/${BASE}...HEAD) → full build/test, plus the always-run gates listed there. Tee long output to a file and read failures from there if the output overflows. If config is absent, ask the user for the format/lint/build/test command.
 ${previousFailing ? `Pending failures from the previous attempt: ${previousFailing}` : ''}
@@ -205,7 +221,7 @@ green=true ONLY with the full Verify command passing end to end. If you can't, g
 }
 
 function reconPrompt(isRecheck) {
-  return `${ctx()}
+  return `${ctx(isRecheck ? 'verify-plan-recheck' : 'verify-plan')}
 
 You are the VERIFY-PLAN agent${isRecheck ? ' (RE-CHECK post-fix)' : ''} — plan↔diff reconciliation with fresh eyes. You implemented nothing; do not assume intent.
 
@@ -221,7 +237,7 @@ Return the four structured buckets; empty if clean.`
 }
 
 function reconFixPrompt(recon) {
-  return `${ctx()}
+  return `${ctx('recon-fix')}
 
 Read ${ROLE_DIR}/wave-implementer.md and operate as that agent, with one difference: your "wave" is the verify-plan findings below. Resolve each Missing (implement the contracted item) and each Diverged (align the code to the contract — if the deviation is deliberate and superior, keep the code and record it as a decision with the why). Unplanned: assess; remove if it's value-less scope-creep, record as a decision if it stays. UntestedPremises: write the test that protects each premise (per the repo's test conventions in ${CONFIG} › Conventions — a test that BREAKS if the premise is violated, not a happy path) and fill its **Tests:** field. Incremental verify + commit + push + ledger as usual.
 
@@ -229,8 +245,8 @@ Findings:
 ${JSON.stringify(recon, null, 2)}`
 }
 
-function prPrompt(setup, decisions, residual, mustFullBuild, testEvidence) {
-  return `${ctx()}
+function prPrompt(setup, decisions, residual, testEvidence) {
+  return `${ctx('pr-author')}
 
 Read ${ROLE_DIR}/pr-author.md and operate as that agent.
 
@@ -243,7 +259,8 @@ ${JSON.stringify(testEvidence, null, 2)}
 ${JSON.stringify(decisions, null, 2)}
 - verify-plan residuals for the "What this PR does NOT cover" section (empty = omit the section):
 ${JSON.stringify(residual, null, 2)}
-- ${mustFullBuild ? `There were post-verify fixes: run the repo's full Verify command (${CONFIG} › Verify) before opening the PR (in addition to the rebase rule in the role file).` : 'Build already verified; run the full Verify command only if the rebase brought changes from the base (role-file rule).'}`
+- Integrating the base: \`git fetch origin ${BASE} && git merge --no-edit origin/${BASE}\` — **never rebase, never force**. A conflict you cannot resolve mechanically and safely → \`git merge --abort\` + blocked.
+- Build: the full Verify already ran green on this branch. Run it again ONLY if the merge brought new commits; if the merge was a no-op, go straight to the PR body.`
 }
 
 // ---------------------------------------------------------------------------
@@ -284,13 +301,42 @@ const allTestEvidence = []
 const waveReports = []
 let blocked = null
 // closing gate: done with a non-empty untestedItems does NOT close the wave (untested commitments are the cheapest review findings to prevent at the source)
+const untestedFailure = (r) => ((r.untestedItems || []).length
+  ? `test gate: items without a test or justification — ${r.untestedItems.join(' | ')}. Write the tests (or justify na in testEvidence) to close the wave.`
+  : null)
+// `partial` closes what it delivered (same test gate) but must say what is left and in what
+// state it leaves the branch — that is the continuation agent's whole briefing.
 const closeFailure = (r) => {
   if (!r) return 'no result'
+  if (r.status === 'partial') {
+    if (!(r.remaining && r.remaining.goal)) return 'partial without remaining: describe the goal + contractItems of what is left'
+    if (!(r.handoff || '').trim() || r.handoff === 'none') return 'partial without handoff: describe the branch state for the continuation agent'
+    return untestedFailure(r)
+  }
   if (r.status !== 'done') return r.blockedReason || 'blocked without reason'
-  if ((r.untestedItems || []).length) return `test gate: items without a test or justification — ${r.untestedItems.join(' | ')}. Write the tests (or justify na in testEvidence) to close the wave.`
-  return null
+  return untestedFailure(r)
 }
-for (const wave of waves) {
+// Continuation id/title derived from the wave id: 3 → 3.1 → 3.2 (never 3.1.1).
+const continuationOf = (wave, remaining) => {
+  const [rootId, seq] = String(wave.id).split('.')
+  const n = Number(seq || 0) + 1
+  return {
+    id: `${rootId}.${n}`,
+    title: `${String(wave.title).replace(/ \(cont\. \d+\)$/, '')} (cont. ${n})`,
+    goal: remaining.goal,
+    contractItems: remaining.contractItems || [],
+    files: remaining.files || wave.files,
+  }
+}
+const pending = [...waves]
+let executed = 0
+while (pending.length) {
+  if (executed >= MAX_WAVE_RUNS) {
+    blocked = { wave: pending[0].id, title: pending[0].title, reason: `continuation ceiling: ${executed} waves executed (max ${MAX_WAVE_RUNS})` }
+    break
+  }
+  const wave = pending.shift()
+  executed++
   let res = await tryAgent(wavePrompt(wave), { schema: WAVE_RESULT, label: `wave-${wave.id}: ${wave.title}`, phase: 'Implement', ...ROLE.wave })
   let failure = closeFailure(res)
   if (failure) {
@@ -304,18 +350,35 @@ for (const wave of waves) {
   }
   allDecisions.push(...(res.decisions || []))
   allTestEvidence.push(...(res.testEvidence || []))
-  waveReports.push({ wave: wave.id, title: wave.title, commits: res.commitShas || [], handoff: res.handoff || 'none' })
-  log(`wave ${wave.id} done: ${(res.commitShas || []).length} commit(s), ${(res.decisions || []).length} decision(s), ${(res.testEvidence || []).length} item(s) with a named test`)
+  waveReports.push({ wave: wave.id, title: wave.title, status: res.status, commits: res.commitShas || [], handoff: res.handoff || 'none' })
+  log(`wave ${wave.id} ${res.status === 'partial' ? 'partial' : 'done'}: ${(res.commitShas || []).length} commit(s), ${(res.decisions || []).length} decision(s), ${(res.testEvidence || []).length} item(s) with a named test`)
+  if (res.status === 'partial') {
+    const next = continuationOf(wave, res.remaining)
+    pending.unshift(next)
+    log(`wave ${wave.id} returned remaining — queued continuation ${next.id}: ${next.goal.slice(0, 120)}`)
+  }
 }
 if (blocked) {
   return { status: 'blocked', stage: 'implement', blocked, wavesDone: waveReports, decisions: allDecisions, note: 'work of the completed waves is committed and pushed on the branch' }
 }
 
 phase('Verify')
-let green = false
-let failingSummary = ''
-for (let attempt = 1; attempt <= 3 && !green; attempt++) {
-  const v = await tryAgent(verifyPrompt(attempt, failingSummary), { schema: VERIFY_RESULT, label: `verify-${attempt}`, phase: 'Verify', ...ROLE.verify })
+const runVerify = (label, attemptLabel, previousFailing) => tryAgent(
+  verifyPrompt(label, attemptLabel, previousFailing),
+  { schema: VERIFY_RESULT, label, phase: 'Verify', ...ROLE.verify },
+)
+// verify-plan reads the diff the waves already committed, so it does not depend on the verify:
+// the two open together. Fix commits the verify makes land in the recheck, which runs after the
+// recon-fix.
+const [v1, recon0] = await parallel([
+  () => runVerify('verify-1', 'attempt 1 of 3', ''),
+  () => tryAgent(reconPrompt(false), { schema: RECON_RESULT, label: 'verify-plan', phase: 'Verify', ...ROLE.verifyPlan }),
+])
+let green = !!v1?.green
+let failingSummary = v1?.failingSummary || ''
+if (!green) log(`verify attempt 1: still red — ${failingSummary.slice(0, 200)}`)
+for (let attempt = 2; attempt <= 3 && !green; attempt++) {
+  const v = await runVerify(`verify-${attempt}`, `attempt ${attempt} of 3`, failingSummary)
   green = !!v?.green
   failingSummary = v?.failingSummary || ''
   if (!green) log(`verify attempt ${attempt}: still red — ${failingSummary.slice(0, 200)}`)
@@ -324,21 +387,36 @@ if (!green) {
   return { status: 'verify-failed', stage: 'verify', failingSummary, wavesDone: waveReports, decisions: allDecisions, note: 'branch pushed with a red build — do NOT open a PR' }
 }
 
-let recon = await tryAgent(reconPrompt(false), { schema: RECON_RESULT, label: 'verify-plan', phase: 'Verify', ...ROLE.verifyPlan })
-let reconFixed = false
+let recon = recon0
 if (recon && ((recon.missing || []).length || (recon.diverged || []).length || (recon.untestedPremises || []).length)) {
   log(`verify-plan: ${(recon.missing || []).length} missing, ${(recon.diverged || []).length} diverged, ${(recon.untestedPremises || []).length} premise(s) without a test — 1 fix round`)
   const fix = await tryAgent(reconFixPrompt(recon), { schema: WAVE_RESULT, label: 'recon-fix', phase: 'Verify', ...ROLE.wave })
   if (fix?.decisions) allDecisions.push(...fix.decisions)
-  reconFixed = true
-  recon = await tryAgent(reconPrompt(true), { schema: RECON_RESULT, label: 'verify-plan-recheck', phase: 'Verify', ...ROLE.verifyPlan })
+  // The recon-fix committed new code: ONE final full build closes the run, in parallel with the
+  // recheck. The PR author then builds again only if merging the base brings commits.
+  const [vf, recheck] = await parallel([
+    () => runVerify('verify-final', 'final build after the recon-fix', ''),
+    () => tryAgent(reconPrompt(true), { schema: RECON_RESULT, label: 'verify-plan-recheck', phase: 'Verify', ...ROLE.verifyPlan }),
+  ])
+  green = !!vf?.green
+  failingSummary = vf?.failingSummary || ''
+  if (!green) {
+    log(`final verify: red after the recon-fix — ${failingSummary.slice(0, 200)}`)
+    const vr = await runVerify('verify-final-retry', 'last build (retry of the final build)', failingSummary)
+    green = !!vr?.green
+    failingSummary = vr?.failingSummary || failingSummary
+  }
+  if (!green) {
+    return { status: 'verify-failed', stage: 'verify', failingSummary, wavesDone: waveReports, decisions: allDecisions, note: 'the recon-fix left the build red — do NOT open a PR' }
+  }
+  recon = recheck
 }
 const residual = recon || { missing: [], diverged: [], unplanned: [] }
 
 phase('PR')
-const pr = await tryAgent(prPrompt(setup, allDecisions, residual, reconFixed, allTestEvidence), { schema: PR_RESULT, label: 'pr-author', phase: 'PR', ...ROLE.prAuthor })
+const pr = await tryAgent(prPrompt(setup, allDecisions, residual, allTestEvidence), { schema: PR_RESULT, label: 'pr-author', phase: 'PR', ...ROLE.prAuthor })
 if (!pr) {
-  // The PR author works (rebase, push, gh pr create) BEFORE reporting — a crash at the report
+  // The PR author works (merge, push, gh pr create) BEFORE reporting — a crash at the report
   // step does not mean the PR was not opened. 'pr-unconfirmed' tells the orchestrator to check
   // `gh pr view --head <branch>` and resume from the ledger instead of re-running from scratch.
   return {
@@ -358,7 +436,7 @@ return {
   roles: ROLE,
   prNumber: pr?.prNumber,
   prUrl: pr?.prUrl,
-  rebased: pr?.rebased || false,
+  mergedMain: pr?.mergedMain || false,
   blockedReason: pr?.blockedReason,
   resumed: setup.resumed,
   wavesDone: waveReports,
