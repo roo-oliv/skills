@@ -70,7 +70,7 @@ Each file's header carries `**Status:** draft` (→ `approved` at Phase 6 → `i
 **Source:** {text | file | resolved URL}
 **Suggested branch:** {type}/{kebab-slug}   ← follow the commit/PR conventions from config › Conventions
 **Domains:** {list}
-**Risk tier:** {direct | deep-plan (reduced — single refutation) | deep-plan} — {1-line justification}
+**Risk tier:** {direct | deep-plan (reduced — 2 refuters) | deep-plan} — {1-line justification}
 **Status:** draft
 ```
 
@@ -93,7 +93,7 @@ Decide **on your own** — don't ask — and state the decision with a 1–2 lin
 
 Otherwise, go direct. On a genuine doubt between tiers in a sensitive domain, prefer deep-plan (false-heavy is cheap; false-light ships the gap).
 
-**Intermediate tier — reduced deep-plan (single refutation):** when a deep-plan trigger holds but the root cause is already **confirmed in the code with file:line** and the change is **single-seam** (one method/formula, no new status and no state machine), deep-plan's full fan-out re-pays enumeration Phase 1 already did. In that case: fill the artifacts yourself (Contract, interaction matrix, dimension table, precondition diff) from the Phase 1 map, and dispatch **1 adversarial refuter agent** (multi-lens in the prompt: the real algebra/caps, consumers, existing tests that would break, constructibility of the scenarios) over the complete plan. Incorporate the refutations and note in the header `**Risk tier:** deep-plan (reduced — single refutation)`. Calibration from a real production run of this pipeline (a single-seam sensitive-domain bugfix with a refuted plan-contract): the single refuter cost ~4% of the pipeline's tokens and caught the run's only planning Blocker — the best ROI in the pipeline. What the reduced tier cuts is the enumeration fan-out, never the refutation. Write the standalone contract to `.claude/deep-plan/<branch>-<shortSha>.md` all the same (it is what the PR gate reads).
+**Intermediate tier — reduced deep-plan (2 refuters):** when a deep-plan trigger holds but the root cause is already **confirmed in the code with file:line** and the change is **single-seam** (one method/formula, or a swap of an existing derived quantity's base, with no new status and no state machine), deep-plan's full fan-out re-pays enumeration Phase 1 already did. In that case invoke `/deep-plan <plan path> reduced` (Skill tool) — its Phase 0 maps the `reduced` token to `args.tier: 'reduced'` and the Workflow runs the same DAG with **2 refuters** (quantity + completeness lenses) instead of the full enumeration fan-out. **Don't hand-roll a refuter.** Note in the header `**Risk tier:** deep-plan (reduced — 2 refuters)`. Calibration from a real production run of this pipeline (a single-seam sensitive-domain bugfix with a refuted plan-contract): the refutation cost ~4% of the pipeline's tokens and caught the run's only planning Blocker — the best ROI in the pipeline. What the reduced tier cuts is the enumeration fan-out, never the refutation. The standalone contract still goes to `.claude/deep-plan/<branch>-<shortSha>.md` (it is what the PR gate reads).
 
 When the full deep-plan runs: use its "Write artifacts into the plan" option to merge the refuted contract into the plan file, and **note in the header** `**Risk tier:** deep-plan (ran — contract merged)`. Residual GAPs become explicit approval items in Phase 6, never silently accepted. The standalone contract that deep-plan writes to `.claude/deep-plan/<branch>-<shortSha>.md` is committed by `/implement`'s wave 1 (it is what the PR gate reads).
 

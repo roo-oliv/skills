@@ -75,6 +75,16 @@ redelivery can transition behind your back (enumerate those async transitioners
 as columns). Each seam that copies a guard feeds Agent 6 / the precondition diff
 — name them.
 
+### Step 5: diff every guard copy you found
+
+For **each copy**, emit the precondition-diff row with it — `oldPrecondition`
+(what the guard relied on where it was written), `newReality` (what holds for
+*this* caller once the intent ships), `resolution` (keep / tighten / replace, and
+where). ≤ 240 chars each. You found the copy and read its caller, so you hold the
+evidence; nothing downstream re-derives it. In the `SettlementSeams` schema a copy
+is then `{copy, oldPrecondition, newReality, resolution}` — emit a bare
+`file:line` string only for a copy you could not read.
+
 ## Output
 
 When the Workflow supplies a `SettlementSeams` schema, emit it. Standalone:
@@ -91,8 +101,10 @@ When the Workflow supplies a `SettlementSeams` schema, emit it. Standalone:
 ## Required executable seams (premise → require/check)
 - <invariant the intent depends on> → `require(...)` at `<seam>` — exists / **MISSING**
 
-## Guards copied across seams (hand to precondition diff)
-- `<predicate>` appears at <seam A>, <seam B>, <seam C> — each needs a precondition row.
+## Guards copied across seams (the precondition diff)
+| predicate | copy | old precondition | new reality | resolution |
+|---|---|---|---|---|
+| `<predicate>` | <seam A> | <what it relied on> | <what holds for this caller> | <keep/tighten/replace @ line> |
 ```
 
 If the intent touches no creation/mutation or recompute path, return

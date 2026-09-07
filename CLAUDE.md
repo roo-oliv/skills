@@ -37,6 +37,11 @@ file runs on a Kotlin backend, a TS app, and a C# game engine.
   `args` and resolve role files as `${ARGS.repoRoot}/.claude/skills/<name>/agents/…`. Validate a
   workflow edit by wrapping it in an async fn and running `node --check` (top-level `return`
   isn't valid bare).
+- **`workflows/tests/*.test.mjs`** do that wrapping and then drive the script's test-only `seed*`
+  `args` paths, so the assertions exercise the SHIPPED pure functions, not a copy — and a parse
+  error fails the suite, which is the `node --check` above.
+  `node workflows/tests/deep-plan-engine.test.mjs` must be green before a workflow commit. Not
+  vendored: the installer globs `workflows/*.js`.
 - **Hooks / scripts** are POSIX-ish bash; validate with `bash -n`.
 - **`ci/*.py`** — Python 3 **stdlib only, ≥ 3.9**, 120 columns, and every path/glob/threshold read from
   `docs/agents/skills-config.md` via `ci/skills_config.py`, never a constant. Each script has a
@@ -54,7 +59,9 @@ file runs on a Kotlin backend, a TS app, and a C# game engine.
   consumer's `.claude/settings.json`, and the consumer's own value always wins. Keep each fragment to one
   concern (`hooks.json`, `env.json`) and never write a key the consumer would want to own without knowing.
 - What each toolkit does and why: [`docs/context-toolkit.md`](docs/context-toolkit.md),
-  [`docs/telemetry.md`](docs/telemetry.md), [`docs/lint-ratchet.md`](docs/lint-ratchet.md).
+  [`docs/telemetry.md`](docs/telemetry.md), [`docs/lint-ratchet.md`](docs/lint-ratchet.md). Why every
+  workflow constant and per-role model is what it is — plus the audit log a model upgrade appends to:
+  [`docs/workflow-calibration.md`](docs/workflow-calibration.md).
 
 ## When you add or rename a skill
 

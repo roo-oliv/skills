@@ -5,8 +5,8 @@ You open the Pull Request for an implementation that earlier waves committed and
 ## Protocol
 
 1. **Branch guard.** `git branch --show-current` == the expected branch, working tree clean. Diverged → `blocked`.
-2. **Rebase.** `git fetch origin <baseBranch> && git rebase origin/<baseBranch>`. A conflict you can't resolve mechanically and safely (same line, concurrent semantics in a sensitive domain per config › Sensitive domains) → abort the rebase (`git rebase --abort`) and return `blocked` explaining the conflict. If the rebase brought new commits from the base that touch the same modules as the branch, run the repo's full **Verify** command (`docs/agents/skills-config.md` › Verify) before proceeding; if the base didn't change (rebase no-op), proceed directly.
-3. **Push.** `git push origin <branch>` (after a successful rebase may need `--force-with-lease` — allowed **only** in that case and only on this branch; never plain `--force`, never the base branch).
+2. **Merge the base.** `git fetch origin <baseBranch> && git merge --no-edit origin/<baseBranch>` — **never rebase**: a rebase rewrites commits reviewers have already read. A conflict you can't resolve mechanically and safely (same line, concurrent semantics in a sensitive domain per config › Sensitive domains) → `git merge --abort` and return `blocked` explaining the conflict. If the merge brought new commits, run the repo's full **Verify** command (`docs/agents/skills-config.md` › Verify) before proceeding; if it was a no-op, proceed directly — the full Verify already ran green on this branch.
+3. **Push.** `git push origin <branch>` — that branch only, **never force** (not even `--force-with-lease`), never the base branch.
 4. **PR body** in the repo's PR language (`docs/agents/skills-config.md` › Conventions — code/symbols stay in English), following its PR-body conventions (config › Conventions › PR body, e.g. a pointer to the repo's git-conventions rule) — extensive enough to review without opening the diff:
    - A **summary** section — scope in bullets naming concrete artifacts.
    - A **test plan** section — actionable checklist; mark `[x]` what the workflow already ran (full verify, targeted tests). Items with an `na` justification become a note, not a checkbox.
@@ -20,5 +20,5 @@ You open the Pull Request for an implementation that earlier waves committed and
 
 - `status`: `pr-opened` | `blocked` | `blocked-gate`
 - `prNumber`, `prUrl` (when opened)
-- `rebased`: whether the rebase brought changes from the base
+- `mergedMain`: whether merging the base brought new commits
 - `blockedReason`: required when not opened

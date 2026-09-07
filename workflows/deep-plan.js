@@ -2,11 +2,11 @@ export const meta = {
   name: 'deep-plan',
   description: 'Fill and adversarially refute a plan-contract (matrix, dimension table, precondition diff) from design intent + the live codebase, gating on completeness before synthesis.',
   whenToUse: 'Heavy pass of the /deep-plan skill: a sensitive-domain change that adds/modifies a status/lifecycle or replaces a flow. Invoked by .claude/skills/deep-plan/SKILL.md.',
-  calibratedFor: 'Frontier models as of 2026-08 — re-audit on each model upgrade (see the skill\'s Key rules).',
+  calibratedFor: 'Frontier models as of 2026-09 — re-audit on each model upgrade (docs/workflow-calibration.md).',
   phases: [
-    { title: 'Enumerate', detail: 'grep caller-enumerated matrix columns + state-mutation seams + guard copies' },
-    { title: 'Analyze', detail: 'dimension table, matrix cells, premise/test obligations' },
-    { title: 'Refute', detail: 'one round of anchoring-free lensed refuters; the resolver reopens cells/rows' },
+    { title: 'Enumerate', detail: 'grep caller-enumerated matrix columns + state-mutation seams + guard copies (∥ Analyze)' },
+    { title: 'Analyze', detail: 'dimension table, matrix cells sharded by row, premise/test obligations + Contract block' },
+    { title: 'Refute', detail: 'one round of anchoring-free lensed refuters, each returning its own reopening patch' },
     { title: 'Gate', detail: 'programmatic completeness: no empty/unjustified cell, every load-bearing premise executable, every guard copy diffed' },
     { title: 'Synthesize', detail: 'deterministic verdict header + lossless artifacts (rendered in JS); LLM writes only the narrative synthesis' },
   ],
@@ -122,7 +122,28 @@ const SETTLEMENT_SEAMS = {
         required: ['predicate', 'copies'],
         properties: {
           predicate: { type: 'string' },
-          copies: { type: 'array', items: { type: 'string' }, description: 'file:line of each copy' },
+          // A copy is either a bare `file:line` or the precondition-diff ROW for that copy,
+          // already filled: this agent found the copy and read its caller, so it holds the
+          // evidence — nothing downstream has to re-derive it from scratch.
+          copies: {
+            type: 'array',
+            description: 'each copy: `file:line`, or {copy, oldPrecondition, newReality, resolution} with the precondition row filled',
+            items: {
+              oneOf: [
+                { type: 'string' },
+                {
+                  type: 'object',
+                  required: ['copy'],
+                  properties: {
+                    copy: { type: 'string', description: 'file:line of this copy' },
+                    oldPrecondition: { type: 'string', maxLength: 240 },
+                    newReality: { type: 'string', maxLength: 240 },
+                    resolution: { type: 'string', maxLength: 240 },
+                  },
+                },
+              ],
+            },
+          },
         },
       },
     },
@@ -152,7 +173,7 @@ const MATRIX_CELLS = {
 
 const PREMISE_OBLIGATIONS = {
   type: 'object',
-  required: ['tests', 'premises', 'drift'],
+  required: ['tests', 'premises', 'drift', 'contract'],
   properties: {
     tests: {
       type: 'array',
@@ -187,9 +208,93 @@ const PREMISE_OBLIGATIONS = {
         properties: { doc: { type: 'string' }, what: { type: 'string' } },
       },
     },
+    // Contract block (plan-contract Artifact 1). This agent needs only the intent, so it runs
+    // at t=0 and the Contract no longer waits on a downstream fill agent — the engine folds the
+    // failing-first test obligations into the same block deterministically.
+    contract: {
+      type: 'array',
+      items: { type: 'string', maxLength: 280 },
+      description: 'atomic commitments: wiring points, predicates, invariants, exact values, files',
+    },
   },
 }
 
+const PRECONDITION_ROW = {
+  type: 'object',
+  required: ['guard', 'copy', 'oldPrecondition', 'newReality', 'resolution'],
+  properties: {
+    guard: { type: 'string', description: 'the predicate, matching a copiedGuards predicate' },
+    copy: { type: 'string', description: 'file:line of this copy' },
+    oldPrecondition: { type: 'string', maxLength: 240 },
+    newReality: { type: 'string', maxLength: 240 },
+    resolution: { type: 'string', maxLength: 240 },
+  },
+}
+
+// The full-draft shape the gates run over — one object, so every check is a pure function.
+const DRAFT = {
+  type: 'object',
+  required: ['contract', 'matrix', 'dimension', 'precondition', 'premises'],
+  properties: {
+    contract: { type: 'array', items: { type: 'string', maxLength: 280 } },
+    matrix: {
+      type: 'object',
+      required: ['columns', 'states', 'cells'],
+      properties: {
+        columns: { type: 'array', items: { type: 'string' } },
+        states: { type: 'array', items: { type: 'string' } },
+        cells: MATRIX_CELLS.properties.cells,
+      },
+    },
+    dimension: {
+      type: 'object',
+      required: ['rows', 'violations'],
+      properties: {
+        rows: DIMENSION_TABLE.properties.rows,
+        violations: DIMENSION_TABLE.properties.violations,
+      },
+    },
+    precondition: { type: 'array', items: PRECONDITION_ROW },
+    premises: PREMISE_OBLIGATIONS.properties.premises,
+  },
+}
+
+// The unit of change every agent after the analyze phase emits: only what it ADDS or
+// CHANGES, merged by key in applyPatch(). Re-emitting the whole — and growing — draft every
+// round is what crashed a run on the 64k output-token ceiling: a late refuter found its
+// strongest refutation (a creation-time amortization gap) and the integrating agent then
+// returned nothing, silently dropping it. The merge never deletes, so a thin or malformed
+// patch degrades to "gate still fails", never to silent corruption.
+const DRAFT_PATCH = {
+  type: 'object',
+  properties: {
+    columnsAdd: { type: 'array', items: { type: 'string' } },
+    statesAdd: { type: 'array', items: { type: 'string' } },
+    cellsUpsert: { type: 'array', items: MATRIX_CELLS.properties.cells.items },
+    dimensionRowsUpsert: { type: 'array', items: DIMENSION_TABLE.properties.rows.items },
+    // A refuter OPENS a dimension violation (it never resolves one); appended uniquely by
+    // (variable, issue) so two refuters attacking the same variable stay one row.
+    violationsAdd: { type: 'array', items: DIMENSION_TABLE.properties.violations.items },
+    violationsResolved: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['variable', 'resolution'],
+        properties: {
+          variable: { type: 'string' },
+          issue: { type: 'string' },
+          resolution: { type: 'string', maxLength: 240 },
+        },
+      },
+    },
+    premisesUpsert: { type: 'array', items: PREMISE_OBLIGATIONS.properties.premises.items },
+    preconditionUpsert: { type: 'array', items: PRECONDITION_ROW },
+    contractAdd: { type: 'array', items: { type: 'string', maxLength: 280 } },
+  },
+}
+
+// Declared AFTER DRAFT_PATCH: a refuter now carries its OWN reopening patch. Whoever holds
+// the evidence writes the reopening, so the separate resolver hop after each round is gone.
 const REFUTATION = {
   type: 'object',
   required: ['refutations', 'survived', 'missingColumns'],
@@ -223,79 +328,7 @@ const REFUTATION = {
         properties: { site: { type: 'string' }, reads: { type: 'string' } },
       },
     },
-  },
-}
-
-const PRECONDITION_ROW = {
-  type: 'object',
-  required: ['guard', 'copy', 'oldPrecondition', 'newReality', 'resolution'],
-  properties: {
-    guard: { type: 'string', description: 'the predicate, matching a copiedGuards predicate' },
-    copy: { type: 'string', description: 'file:line of this copy' },
-    oldPrecondition: { type: 'string', maxLength: 240 },
-    newReality: { type: 'string', maxLength: 240 },
-    resolution: { type: 'string', maxLength: 240 },
-  },
-}
-
-// The resolver / consolidator return the full draft so gates run over one object.
-const DRAFT = {
-  type: 'object',
-  required: ['contract', 'matrix', 'dimension', 'precondition', 'premises'],
-  properties: {
-    contract: { type: 'array', items: { type: 'string', maxLength: 280 } },
-    matrix: {
-      type: 'object',
-      required: ['columns', 'states', 'cells'],
-      properties: {
-        columns: { type: 'array', items: { type: 'string' } },
-        states: { type: 'array', items: { type: 'string' } },
-        cells: MATRIX_CELLS.properties.cells,
-      },
-    },
-    dimension: {
-      type: 'object',
-      required: ['rows', 'violations'],
-      properties: {
-        rows: DIMENSION_TABLE.properties.rows,
-        violations: DIMENSION_TABLE.properties.violations,
-      },
-    },
-    precondition: { type: 'array', items: PRECONDITION_ROW },
-    premises: PREMISE_OBLIGATIONS.properties.premises,
-  },
-}
-
-// A PATCH the resolver returns instead of the full draft for the ITERATIVE steps
-// (refute-resolve, gate-justify). Re-emitting the whole — and growing — draft
-// every round is what crashed the run on the 64k output-token ceiling: a
-// round-5 refuter found its strongest refutation (a creation-time amortization
-// gap) and the resolver then returned nothing, silently dropping it. The resolver
-// now emits only what it adds/changes; applyPatch() merges by key. The merge is
-// additive/override-only — it can never delete a filled cell/row, so a thin or
-// malformed patch degrades to "gate still fails", never to silent corruption.
-const DRAFT_PATCH = {
-  type: 'object',
-  properties: {
-    columnsAdd: { type: 'array', items: { type: 'string' } },
-    statesAdd: { type: 'array', items: { type: 'string' } },
-    cellsUpsert: { type: 'array', items: MATRIX_CELLS.properties.cells.items },
-    dimensionRowsUpsert: { type: 'array', items: DIMENSION_TABLE.properties.rows.items },
-    violationsResolved: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['variable', 'resolution'],
-        properties: {
-          variable: { type: 'string' },
-          issue: { type: 'string' },
-          resolution: { type: 'string', maxLength: 240 },
-        },
-      },
-    },
-    premisesUpsert: { type: 'array', items: PREMISE_OBLIGATIONS.properties.premises.items },
-    preconditionUpsert: { type: 'array', items: PRECONDITION_ROW },
-    contractAdd: { type: 'array', items: { type: 'string', maxLength: 280 } },
+    patch: DRAFT_PATCH,
   },
 }
 
@@ -317,11 +350,21 @@ const ARGS = (typeof args === 'string' && args.trim())
 
 const intent = ARGS.intent || ''
 const domains = ARGS.domains || []
+// Phase-1 reading list, prepared ONCE by the orchestrator (SKILL.md Phase 1) instead of by each
+// of the ~13 agents. Empty is legal: readingList() falls back to a self-serve, index-only form.
+const brief = String(ARGS.brief || '').trim()
 const noThrow = !!ARGS.noThrow
 const seedDraft = ARGS.seedDraft
 // The repo root the skill is running in. Every agent search MUST stay inside it
 // (and inside .gitignore) — never /tmp, never sibling worktrees. See ctx().
 const repoRoot = ARGS.repoRoot || '(the current repo root / cwd)'
+// Tier: `economy` (default), `full` (every worker agent on the decision tier) or `reduced` —
+// a single-seam change or a formula / base swap with no new status and no state machine: same
+// DAG, 2 refuters on the quantity and completeness lenses. `ARGS.full === true` is the legacy
+// spelling of `full`. An unknown value is logged and falls back to `economy`.
+const TIER_NAMES = ['economy', 'full', 'reduced']
+const TIER = (ARGS.full === true || ARGS.tier === 'full') ? 'full' : (TIER_NAMES.includes(ARGS.tier) ? ARGS.tier : 'economy')
+if (ARGS.tier && !TIER_NAMES.includes(ARGS.tier)) log(`ignoring unknown tier ${JSON.stringify(ARGS.tier)} — running economy (valid: ${TIER_NAMES.join(' / ')})`)
 // 4 lensed refuters, ONE round. History: a 4x5 run reached the full r1+r2 cluster
 // union in one run — but at ~1.8x cost, STILL no convergence (flat 16/12/15/15/15),
 // and a gate of 374->0. The post-mortem found the real bug was label drift, not
@@ -340,16 +383,21 @@ const repoRoot = ARGS.repoRoot || '(the current repo root / cwd)'
 // doesn't converge). Refuters run in PARALLEL (well under the concurrency cap), so breadth
 // is ~free on wall-clock: it trades tokens for coverage. Each refuter takes a DISTINCT lens
 // (REFUTER_LENSES) so N refuters give N near-independent surfaces, not N collisions on the
-// same targets. The ceiling is the resolver patch size (all fresh funnel into ONE patch ->
-// StructuredOutput bloat), not thinking — so this is a band, not "more is better".
+// same targets. The ceiling is each refuter's OWN patch size (StructuredOutput bloat), not
+// thinking — so this is a band, not "more is better".
 // ARGS.refutersPerRound overrides per-run for a big change.
-const REFUTERS_PER_ROUND = Math.max(1, ARGS.refutersPerRound || 4)
+const REFUTERS_PER_ROUND = Math.max(1, ARGS.refutersPerRound || (TIER === 'reduced' ? 2 : 4))
 const REFUTER_LENSES = [
   'QUANTITY / dimensional: attack the derived values — a value combined at the wrong base (e.g. face vs residual vs principal-only vs with-interest for a currency amount, or a window-bounded sum vs an instantaneous snapshot for a count), an uncapped settle/mint/derivation, a balance or Σ=0 invariant checked against a SELF-REFERENTIAL sum, a double-count across legs.',
   'ASYNC / ordering / lifecycle: attack timing — a post-commit write lost to a same-transaction join, a crash window between ack and commit, a non-idempotent re-fire / double-action, a two-clock lag, a predicate that must read live status-as-of-event but reads it once.',
   'PREMISE / invariant: attack the stated invariants — a path that violates an immutability / sum / identity premise or a CORE TENET, a load-bearing invariant with no require/check at its seam, a premise the new code introduces but never protects.',
   'COMPLETENESS / wrong-cell: attack the matrix itself — a cell marked handled/N·A that is actually a GAP, a column or state the matrix never enumerated, a copied guard whose precondition is now false for the new caller set.',
 ]
+// The lenses actually dispatched. `reduced` keeps the two a single-seam change turns on:
+// QUANTITY (the formula/base being swapped) and COMPLETENESS (what a seam-local plan never
+// enumerated). Refuter i always gets ACTIVE_LENSES[i % length], so a raised
+// ARGS.refutersPerRound cycles the reduced pair instead of reaching a dropped lens.
+const ACTIVE_LENSES = TIER === 'reduced' ? [REFUTER_LENSES[0], REFUTER_LENSES[3]] : REFUTER_LENSES
 // ONE refute round by default: every recorded trajectory is FLAT — rounds 2–3 mint as many
 // fresh refutations as round 1 (fix-attack equilibrium, not discovery). Coverage comes from
 // BREADTH (the lensed refuters above) and from an independent re-run (SKILL.md › One run does
@@ -362,14 +410,33 @@ const REFUTE_ROUNDS = Math.max(1, ARGS.refuteRounds || 1)
 // deterministic missing-cell list (missingCells) so it fills the whole grown row/column,
 // and a residual after the loop is recorded (NOT thrown) — deep-plan never blocks.
 const GATE_JUSTIFY_ROUNDS = 2
+// Sizing of the SHARDED matrix work, by CELLS, capped in agent count. One agent per state (or
+// per column) was the first cut, and it lost: the per-agent FIXED cost dominates — every agent
+// writes its whole prompt to cache before its first turn — so 30 single-column gate fills cost
+// more than the one expensive justify pass they replaced. One cheap agent handles ~80 cells
+// reliably (the single full-cartesian agent left 22–60 % of the grid empty only when asked for
+// 120–200); above that the work splits into at most MAX_FILL_AGENTS parallel agents.
+const CELLS_PER_AGENT = Math.max(10, ARGS.cellsPerAgent || 80)
+const MAX_FILL_AGENTS = Math.max(1, ARGS.maxFillAgents || 4)
+// Split `items` into the number of contiguous groups that `cells` cells need at
+// CELLS_PER_AGENT, capped at MAX_FILL_AGENTS — never more groups than items.
+function splitByCells(items, cells) {
+  const list = items || []
+  if (!list.length) return []
+  const n = Math.min(list.length, Math.max(1, Math.min(MAX_FILL_AGENTS, Math.ceil(cells / CELLS_PER_AGENT))))
+  const size = Math.ceil(list.length / n)
+  const out = []
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size))
+  return out
+}
 
 // ---------------------------------------------------------------------------
 // Role x model x effort. A DECIDER (judges a load-bearing quantity or writes what ships:
-// dimension table, state-mutation seams, refuters, resolver, consolidator) runs on the strong
-// model at high effort; a WORKER (collects evidence under a checklist: matrix columns, matrix
-// cells, premise/test obligations) on the cheap model at medium. Thinking is never disabled —
-// effort is lowered instead. Agents of the same phase share model/effort/schema, so they share
-// a cache prefix.
+// dimension table, state-mutation seams, refuters, gate justifier, consolidator) runs on the
+// strong model at high effort; a WORKER (collects evidence under a checklist: matrix columns,
+// matrix cells, premise/test obligations) on the cheap model at medium. Thinking is never
+// disabled — effort is lowered instead. Agents of the same phase share model/effort/schema, so
+// they share a cache prefix.
 //
 // The tier names below are the same five buckets every workflow in this repo uses, and a repo
 // overrides them verbatim in `docs/agents/skills-config.md` › Models (the skill reads that
@@ -388,28 +455,76 @@ for (const [k, v] of Object.entries(ARGS.models || {})) {
 // `economy` is the default (the reasoning-heavy agents are already on the decision tier);
 // `full` — by arg, or by the sensitive-domain / plan-contract trigger the skill passes —
 // upgrades the worker agents too.
-const TIER = (ARGS.full || ARGS.tier === 'full') ? 'full' : 'economy'
 const t = (name, effort) => ({ ...TIERS[name], ...(effort ? { effort } : {}) })
 const ROLE = {
   a1: t('decision'), // analyze:dimension-table
   a2: t('worker'), // enumerate:matrix-columns
-  a3: t('decision'), // enumerate:state-mutation-seams
-  a4: t('worker'), // analyze:matrix-cells
-  a5: t('worker'), // analyze:premises-tests
-  a6: t('decision'), // refute:*
-  resolver: t('decision'), // analyze:fill · refute:resolve-* · gate:justify-*
-  consolidate: t('decision', 'medium'), // synthesize:consolidate — narrow rubric, not a search
+  a3: t('decision'), // enumerate:state-mutation-seams (+ the precondition rows per copy)
+  a4: t('worker'), // analyze:cells-* · analyze:cells-fill · gate:fill-*
+  a5: t('worker'), // analyze:premises-tests (+ the Contract block)
+  a6: t('decision'), // refute:* — each returns its own reopening patch
+  justify: t('decision'), // gate:justify-* — only the violations a cell fill cannot close
+  // One agent, ~a minute, and it owns the contradiction watch — the highest-value output of
+  // the run. The effort downgrade it used to carry bought nothing measurable.
+  consolidate: t('decision'), // synthesize:consolidate
 }
 const FULL_UPGRADES = new Set(['a2', 'a4', 'a5'])
-const role = (k) => (TIER === 'full' && FULL_UPGRADES.has(k) ? t('decision') : ROLE[k])
+// Per-ROLE model/effort overrides for a benchmark arm (`ARGS.roles = { a6: { model: 'sonnet' },
+// a2: { effort: 'low' } }`) — an A/B without editing the script. `ARGS.models` stays the TIER
+// map a repo declares in its config › Models; this is the finer knob, keyed by the ROLE names
+// above and applied AFTER the full-tier upgrade, so an explicit override always wins. An
+// unknown role or a non-object value is logged and ignored: a typo in a benchmark arm must
+// never throw away a long run.
+const ROLE_OVERRIDES = (() => {
+  const out = {}
+  for (const [k, v] of Object.entries(ARGS.roles || {})) {
+    if (!ROLE[k] || !v || typeof v !== 'object') { log(`ignoring role override ${JSON.stringify(k)}: unknown role or non-object value (valid roles: ${Object.keys(ROLE).join(' / ')})`); continue }
+    const o = {}
+    if (v.model) o.model = String(v.model)
+    if (v.effort) o.effort = String(v.effort)
+    if (Object.keys(o).length) out[k] = o
+    else log(`ignoring role override ${JSON.stringify(k)}: neither model nor effort given`)
+  }
+  return out
+})()
+const role = (k) => ({
+  ...(TIER === 'full' && FULL_UPGRADES.has(k) ? t('decision') : ROLE[k]),
+  ...(ROLE_OVERRIDES[k] || {}),
+})
+// The routing actually dispatched — what the run logs and returns, so a benchmark arm is
+// auditable from the result alone instead of from the (pre-override) ROLE defaults.
+const effectiveRoles = () => Object.fromEntries(Object.keys(ROLE).map((k) => [k, role(k)]))
+
+// Phase-1 reading list — shared by ctx() and the refuter prompt, the two places an agent is
+// told what to read. Re-reading a domain's whole premises file (a mature domain's runs to
+// hundreds of KB, and `Read` truncates at 2 000 lines anyway) was the largest measured context
+// cost of a run, paid once PER AGENT; the brief replaces it with ids the orchestrator resolved
+// once. Both branches carry the same hard NEVER, because the fallback is what an ad-hoc
+// invocation runs on.
+function readingList() {
+  if (brief) {
+    return [
+      `=== PHASE-1 BRIEF (prepared once by the orchestrator — this is your reading list) ===`,
+      brief,
+      `=== END BRIEF ===`,
+      `Open a premise ONLY by id (the fetch command in \`docs/agents/skills-config.md\` › Docs layout › premise-by-id, default \`python3 .github/scripts/premise.py <id>\`); open a recurring-failure-mode entry only when the brief lists it or your own evidence names it; read the plan-contract spec only for the artifact you emit; and NEVER read a whole premises file (they run to hundreds of KB and \`Read\` truncates at 2 000 lines — the single largest context cost measured).`,
+    ]
+  }
+  return [
+    `Phase-1 context (no brief was passed — assemble it yourself, inside this repo only). Read \`docs/agents/skills-config.md\` › Docs layout for the exact paths and the premises {domain}/{module} pattern, then read HEADERS AND INDEXES ONLY: the entry headers + trigger lines of the recurring-failure-modes doc (config › Docs layout › Planning — MANDATORY when present; open only the entries whose trigger matches), the section headers of the core-tenets doc (default \`docs/CORE_TENETS.md\`), the plan-contract spec (default \`docs/planning/plan-contract.md\`), and per affected domain its schema doc (default \`docs/schema/{domain}.md\`) + its premises INDEX, opening a premise body by id. If a config section is absent, use these defaults and note it. NEVER read a whole premises file (hundreds of KB; \`Read\` truncates at 2 000 lines).`,
+  ]
+}
 
 // Shared Phase-1 preamble. Agents have file tools and must read the docs
 // themselves — the intent is the analogue of deep-review's diff. Doc paths are
 // NOT hardcoded: agents read the repo's `docs/agents/skills-config.md` (the file
 // `setup` wrote) for where core-tenets / premises / schema / planning docs live,
 // and fall back to the canonical defaults when a section is absent.
-function ctx(roleFile) {
+// The first line is the role marker `ci/wf_timeline.py` keys on to attribute wall-clock and
+// tokens per stage; it must stay line 1 of every prompt this script builds.
+function ctx(roleFile, label) {
   return [
+    `[deep-plan role: ${label}]`,
     `Read \`.claude/skills/deep-plan/agents/${roleFile}\` and operate as that specialist.`,
     `There is NO diff — the codebase on disk is the CURRENT (pre-change) state. Use file tools to discover the real callers, guards, readers, and seams the intent will collide with.`,
     ``,
@@ -419,9 +534,11 @@ function ctx(roleFile) {
     `- One simple command per Bash call. No fragile compound one-liners (\`rg … | head; echo; find …\`) — an unbalanced quote makes the shell hang waiting on stdin.`,
     `- If you query a DB/MCP, bound it (LIMIT, narrow filters). You are analyzing CODE; don't run heavy unbounded prod queries.`,
     ``,
+    `Plan your searches — aim for <= 40 tool calls: locate with \`rg -n\`, read code in RANGES (Read with offset/limit, or \`sed -n 'a,bp'\`), never a whole file over 200 lines; hand a broad caller sweep to an \`Explore\` subagent when the Agent tool is available. Cost is turns x context.`,
+    ``,
     `CONTAMINATION GUARD: the ONLY source of truth for what is being proposed is the DESIGN INTENT below. IGNORE any plan-contract, intent file, \`deep-plan-*.md\`, or cached JSON you encounter on disk — they belong to other runs/projects and will anchor you to the wrong feature. Do not let an on-disk artifact override the intent below.`,
     ``,
-    `Phase-1 context to read (inside this repo only). Read \`docs/agents/skills-config.md\` › Docs layout for the exact paths and the premises {domain}/{module} pattern, then read: the recurring-failure-modes doc (config › Docs layout › Planning — MANDATORY when present: every matching entry is a question you must answer), the core-tenets doc (config › Docs layout › Core tenets; default \`docs/CORE_TENETS.md\`), the plan-contract spec (config › Docs layout › Planning; default \`docs/planning/plan-contract.md\`), and for each affected domain its schema doc + premises (default \`docs/schema/{domain}.md\` + \`docs/{domain}/premises.md\`). If a config section is absent, use these defaults and note it.`,
+    ...readingList(),
     ``,
     `Affected domains: ${domains.join(', ') || '(infer from the intent)'}.`,
     ``,
@@ -530,43 +647,113 @@ function columnsWithSeam(columns) {
   return { kept, dropped }
 }
 
-// Assemble the raw draft from the analyze-phase structured outputs. Precondition
-// rows are seeded one-per-copy from the guard enumeration; the resolver fills them.
+// A `copiedGuards` copy is either a bare `file:line` string or the pre-filled precondition
+// row agent 3 now returns. Every read of a copy goes through this.
+function copyOf(c) { return (c && typeof c === 'object') ? String(c.copy || '') : String(c || '') }
+
+// Every matrix axis carries a leading CODE (S1…, C1…) from the moment it is minted, and every
+// cell is resolved onto an axis by that code before anything keys on it. Without codes,
+// `normCode` falls back to the full label, so a shard that PARAPHRASES its assigned state
+// ("status=HELD" for the verbose label it was handed) mints a phantom state — on a real run
+// five of seven row shards paraphrased, the targeted fill re-did 93 cells, and the gate then
+// faced phantom-states x columns of empty pairs. Codes make the label free text again.
+const AXIS_CODE_RE = /^\s*([SC])(\d+)\b/i
+function codeAxes(labels, prefix) {
+  return (labels || []).map((l, i) => (AXIS_CODE_RE.test(l) ? l : `${prefix}${i + 1} ${l}`))
+}
+function nextCode(axes, prefix) {
+  let max = 0
+  for (const a of axes) { const m = String(a).match(AXIS_CODE_RE); if (m && m[1].toUpperCase() === prefix) max = Math.max(max, Number(m[2])) }
+  return `${prefix}${max + 1}`
+}
+const stripCode = (l) => String(l || '').replace(AXIS_CODE_RE, '').trim()
+const looseLabel = (l) => stripCode(l).toLowerCase().replace(/\s+/g, '')
+// The `Class.method` (or `Class.field`) identifier a column label opens with, when it opens
+// with one — null for free text, and null for a bare class name (two methods of one class are
+// two columns).
+function leadingSymbol(label) {
+  const m = stripCode(label).match(/^([A-Z][A-Za-z0-9]*(?:\.[a-zA-Z_][A-Za-z0-9_]*)+)\b/)
+  return m ? m[1] : null
+}
+// Find the axis a free-text label denotes: by code / exact label, then by shared file:line
+// seam, then by a shared leading `Class.method` symbol, then by containment of the
+// code-stripped text — each of the last three only on a UNIQUE match, so a terse
+// "status=PAID" that sits inside two qualified states stays its own row and never bridges
+// them. null = no axis; the caller mints one.
+function resolveAxis(label, axes) {
+  const list = axes || []
+  const code = normCode(label)
+  const byCode = list.find((a) => normCode(a) === code)
+  if (byCode !== undefined) return byCode
+  const seam = extractSeam(label)
+  if (seam) { const bySeam = list.filter((a) => extractSeam(a) === seam); if (bySeam.length === 1) return bySeam[0] }
+  // Same reader named without a line: independent refuters write
+  // `OrderService.updateStatus (agreement path)` and `… (non-agreement path)` — one site, two
+  // columns. A shared leading `Class.method` symbol is the same column; the path distinction
+  // lives in the cell justification, and GAP wins on the merge.
+  const sym = leadingSymbol(label)
+  if (sym) { const bySym = list.filter((a) => leadingSymbol(a) === sym); if (bySym.length === 1) return bySym[0] }
+  const me = looseLabel(label)
+  if (me.length < 12) return null
+  const contained = list.filter((a) => { const o = looseLabel(a); return o.length >= 12 && (o.includes(me) || me.includes(o)) })
+  return contained.length === 1 ? contained[0] : null
+}
+// Rewrite a cell's state/column onto the axes, minting a CODED axis when nothing matches.
+function landCell(cell, states, columns) {
+  let st = resolveAxis(cell.state, states)
+  if (st === null) { st = AXIS_CODE_RE.test(cell.state) ? cell.state : `${nextCode(states, 'S')} ${cell.state}`; states.push(st) }
+  let col = resolveAxis(cell.column, columns)
+  if (col === null) { col = AXIS_CODE_RE.test(cell.column) ? cell.column : `${nextCode(columns, 'C')} ${cell.column}`; columns.push(col) }
+  return { ...cell, state: st, column: col }
+}
+
+// Assemble the raw draft from the analyze-phase structured outputs. Precondition rows are
+// seeded one-per-copy from the guard enumeration — already filled when agent 3 returned the
+// diff with the copy, so the gate justify only sees what it left blank.
 function assemble(cols, seams, dim, cells) {
   const precondition = []
   for (const g of (seams.copiedGuards || [])) {
-    for (const copy of (g.copies || [])) {
-      precondition.push({ guard: g.predicate, copy, oldPrecondition: '', newReality: '', resolution: '' })
+    for (const c of (g.copies || [])) {
+      const row = (c && typeof c === 'object') ? c : {}
+      precondition.push({
+        guard: g.predicate,
+        copy: copyOf(c),
+        oldPrecondition: row.oldPrecondition || '',
+        newReality: row.newReality || '',
+        resolution: row.resolution || '',
+      })
     }
   }
+  const states = codeAxes(cols.states || [], 'S')
+  const columns = codeAxes((cols.columns || []).map(c => c.name), 'C')
+  const landed = (cells.cells || []).map((c) => landCell(c, states, columns))
   return {
     contract: [],
-    matrix: {
-      columns: (cols.columns || []).map(c => c.name),
-      states: cols.states || [],
-      cells: cells.cells || [],
-    },
+    matrix: { columns, states, cells: landed },
     dimension: { rows: dim.rows || [], violations: dim.violations || [] },
     precondition,
     premises: [],
   }
 }
 
-// Merge a resolver PATCH (DRAFT_PATCH) into the draft. Additive/override-by-key
+// Merge a DRAFT_PATCH into the draft. Additive/override-by-key
 // only: upserts cells (by state+column), dimension rows (by variable), premises
 // (by text), precondition rows (by guard+copy); appends columns/states/contract
 // items uniquely; stamps resolutions onto matching dimension violations. It never
 // deletes, so a malformed patch can only leave the gate unsatisfied — which the
 // gate then catches — rather than silently corrupting a filled draft.
-function applyPatch(draft, patch) {
+// `opts.conservative` is for the refute round and the two matrix fills, where N independent
+// agents patch the SAME draft in sequence: a cell collision resolves through mergeCell (GAP
+// wins, richer text on a tie) instead of last-writer-wins, so the last patch applied cannot
+// bury an earlier reopening.
+function applyPatch(draft, patch, opts = {}) {
   if (!patch) return draft
   const d = JSON.parse(JSON.stringify(draft))
   const uniqPush = (arr, items) => { for (const x of (items || [])) if (!arr.includes(x)) arr.push(x) }
-  // Axes dedupe by CODE (not exact label) so a patch adding "S1" next to an existing
-  // "S1 PERFORMANCE…" doesn't create a normCode-duplicate axis entry.
-  const uniqPushBy = (arr, items, keyFn) => { const seen = new Set(arr.map(keyFn)); for (const x of (items || [])) { const k = keyFn(x); if (!seen.has(k)) { seen.add(k); arr.push(x) } } }
-  uniqPushBy(d.matrix.columns, patch.columnsAdd, normCode)
-  uniqPushBy(d.matrix.states, patch.statesAdd, normCode)
+  // A new axis gets a CODE unless the label already carries one; an add that resolves onto an
+  // existing axis (same code / seam / symbol / text) is a no-op instead of a duplicate.
+  for (const a of (patch.columnsAdd || [])) if (resolveAxis(a, d.matrix.columns) === null) d.matrix.columns.push(AXIS_CODE_RE.test(a) ? a : `${nextCode(d.matrix.columns, 'C')} ${a}`)
+  for (const a of (patch.statesAdd || [])) if (resolveAxis(a, d.matrix.states) === null) d.matrix.states.push(AXIS_CODE_RE.test(a) ? a : `${nextCode(d.matrix.states, 'S')} ${a}`)
   uniqPush(d.contract, patch.contractAdd)
 
   // Key cells by normalized (state,column) CODE so a variant-labeled upsert updates the
@@ -574,28 +761,30 @@ function applyPatch(draft, patch) {
   const ckey = (s, c) => JSON.stringify([normCode(s), normCode(c)])
   const cellIdx = {}
   d.matrix.cells.forEach((c, i) => { cellIdx[ckey(c.state, c.column)] = i })
-  for (const c of (patch.cellsUpsert || [])) {
+  for (const raw of (patch.cellsUpsert || [])) {
+    const c = landCell(raw, d.matrix.states, d.matrix.columns)
     const k = ckey(c.state, c.column)
-    if (k in cellIdx) d.matrix.cells[cellIdx[k]] = c
+    if (k in cellIdx) d.matrix.cells[cellIdx[k]] = opts.conservative ? mergeCell(d.matrix.cells[cellIdx[k]], c) : c
     else { cellIdx[k] = d.matrix.cells.length; d.matrix.cells.push(c) }
   }
   // Referential integrity: refuters add cells faster than they add columnsAdd/statesAdd,
   // so a cell can reference an axis code absent from columns[]/states[] (a run: cells used
   // 15 state-codes / 34 column-codes but the axes declared only 11 / 34, leaving 4 real
-  // states uncovered). Reconcile by CODE so the axes always span every analyzed cell and
-  // the gate validates the real surface, not a stale grid.
-  const haveState = new Set(d.matrix.states.map(normCode))
-  const haveCol = new Set(d.matrix.columns.map(normCode))
-  for (const c of d.matrix.cells) {
-    const sc = normCode(c.state); if (!haveState.has(sc)) { haveState.add(sc); d.matrix.states.push(c.state) }
-    const cc = normCode(c.column); if (!haveCol.has(cc)) { haveCol.add(cc); d.matrix.columns.push(c.column) }
-  }
+  // states uncovered). Landing every cell reconciles the axes so they always span the
+  // analyzed surface and the gate validates it, not a stale grid.
+  d.matrix.cells = d.matrix.cells.map((c) => landCell(c, d.matrix.states, d.matrix.columns))
 
   const rowIdx = {}
   d.dimension.rows.forEach((r, i) => { rowIdx[r.variable] = i })
   for (const r of (patch.dimensionRowsUpsert || [])) {
     if (r.variable in rowIdx) d.dimension.rows[rowIdx[r.variable]] = r
     else { rowIdx[r.variable] = d.dimension.rows.length; d.dimension.rows.push(r) }
+  }
+  const vkey = (x) => JSON.stringify([x.variable, x.issue])
+  const haveViol = new Set(d.dimension.violations.map(vkey))
+  for (const nv of (patch.violationsAdd || [])) {
+    const k = vkey(nv)
+    if (!haveViol.has(k)) { haveViol.add(k); d.dimension.violations.push(nv) }
   }
   for (const vr of (patch.violationsResolved || [])) {
     const hit = d.dimension.violations.find(x => x.variable === vr.variable && (!vr.issue || x.issue === vr.issue))
@@ -618,7 +807,40 @@ function applyPatch(draft, patch) {
     else { preIdx[k] = d.precondition.length; d.precondition.push(p) }
   }
   canonicalizeMatrixStates(d)
+  canonicalizeColumnsBySeam(d)
   return d
+}
+
+// Collapse two column labels that cite the SAME seam (Class:line / file.ext:line) into one
+// column, remapping cells and merging collisions (GAP wins). Four independent refuters name
+// the same reader under four spellings; `normCode` cannot see it (no shared code), and each
+// spelling became its own column on a real run, inflating the cartesian the gate then had to
+// fill. Columns without a seam are left alone. Canonical label = the longest (most context).
+// Idempotent.
+function canonicalizeColumnsBySeam(d) {
+  const columns = (d.matrix && d.matrix.columns) || []
+  if (columns.length < 2) return
+  const bySeam = new Map()
+  for (const c of columns) {
+    const seam = extractSeam(c)
+    if (!seam) continue
+    const g = bySeam.get(seam)
+    if (!g) bySeam.set(seam, { canon: c, members: [c] })
+    else { g.members.push(c); if (String(c).length > String(g.canon).length) g.canon = c }
+  }
+  const canonical = {}
+  for (const g of bySeam.values()) if (g.members.length > 1) for (const m of g.members) canonical[m] = g.canon
+  if (!Object.keys(canonical).length) return
+  const seen = new Set(); const newColumns = []
+  for (const c of columns) { const k = canonical[c] || c; if (!seen.has(k)) { seen.add(k); newColumns.push(k) } }
+  d.matrix.columns = newColumns
+  const byKey = new Map()
+  for (const cell of (d.matrix.cells || [])) {
+    const cc = { ...cell, column: canonical[cell.column] || cell.column }
+    const k = JSON.stringify([normCode(cc.state), normCode(cc.column)])
+    byKey.set(k, byKey.has(k) ? mergeCell(byKey.get(k), cc) : cc)
+  }
+  d.matrix.cells = [...byKey.values()]
 }
 
 // Pick the surviving cell when two variant-state cells collapse onto the same
@@ -771,8 +993,8 @@ function gateCheck(d, copiedGuards) {
 
 // Deterministic cartesian-completeness: the (state × column) pairs (keyed by normCode)
 // that have NO cell. Pure function — the same product gateCheck walks, exposed so the
-// fill (Lever 1) and the gate-justify drive the resolver to fill ONLY the gaps rather
-// than re-emit all N cells. A refuter that adds a column/state grows the product; this
+// targeted fill and the gate's per-column fills answer ONLY the gaps rather than re-emit
+// all N cells. A refuter that adds a column/state grows the product; this
 // surfaces the new empty pairs so the justify pass fills the whole grown row/column, not
 // just the one cell the refuter named (the matrix-growth gate-fail).
 function missingCells(draft) {
@@ -1014,7 +1236,7 @@ function renderVerdict(draft, m) {
     : shape === 'DECAYING' ? ' (decaying toward zero — one or two more rounds would likely close it)'
       : ' (a full round surfaced no new refutation)'
   // Decompose the final round's fresh into resolution-attacks vs new-surface: a FLAT shape
-  // with a high resolution share means fix-attack equilibrium (each resolver patch mints new
+  // with a high resolution share means fix-attack equilibrium (each reopening patch mints new
   // attack surface — the loop is generative), NOT that the original surface is unexplored.
   const mix = (m.freshMixByRound || [])[(m.freshMixByRound || []).length - 1]
   const mixNote = mix && mix.resolution + mix.newSurface > 0
@@ -1075,6 +1297,18 @@ if (seedPatch) {
   phase('Gate')
   const merged = applyPatch(seedPatch.draft, seedPatch.patch)
   log('seed-patch mode: merged patch into draft')
+  return { merged, seedMode: true }
+}
+
+// SEED-REFUTE-MERGE MODE — exercises the refute round's CONSERVATIVE merge (N independent
+// refuter patches applied in order over one draft, GAP winning every collision) for the engine
+// test. ARGS.seedRefuteMerge = { draft, patches }; returns the merged draft.
+const seedRefuteMerge = ARGS.seedRefuteMerge
+if (seedRefuteMerge) {
+  phase('Refute')
+  let merged = seedRefuteMerge.draft
+  for (const p of (seedRefuteMerge.patches || [])) merged = applyPatch(merged, p, { conservative: true })
+  log(`seed-refute-merge mode: merged ${(seedRefuteMerge.patches || []).length} refuter patch(es) conservatively`)
   return { merged, seedMode: true }
 }
 
@@ -1158,101 +1392,143 @@ if (seedVerdict) {
   return { md, seedMode: true }
 }
 
-// =====================================================================
-// PHASE 1 — ENUMERATE: caller-enumerated columns + state-mutation seams + guard copies
-// =====================================================================
-phase('Enumerate')
-const [cols, seams] = await parallel([
-  () => agent(ctx('matrix-columns.md'), { label: 'enumerate:matrix-columns', phase: 'Enumerate', schema: MATRIX_COLUMNS, ...role('a2'), agentType: 'general-purpose' }),
-  () => agent(ctx('state-mutation-seams.md'), { label: 'enumerate:state-mutation-seams', phase: 'Enumerate', schema: SETTLEMENT_SEAMS, ...role('a3'), agentType: 'general-purpose' }),
-])
-if (!cols || !seams) throw new Error('Enumerate phase failed — matrix columns or state-mutation seams missing.')
-// Matrix discipline: keep only columns citing a concrete seam (file:line / source
-// file) so the matrix stays dense — a column without one bloats the fill and leaves
-// empty cells. A genuinely-missing interaction is re-added by a refuter WITH a site.
-const { kept: seamedColumns, dropped: vagueColumns } = columnsWithSeam(cols.columns)
-cols.columns = seamedColumns
-log(`Enumerated ${seamedColumns.length} matrix columns (dropped ${vagueColumns.length} lacking a concrete seam), ${(cols.states || []).length} new states, ${(seams.copiedGuards || []).length} copied guards.`)
-if (vagueColumns.length) log(`  pruned columns (no file:line): ${vagueColumns.map(c => c.name).join(', ')}`)
+// SEED-SPLIT MODE — exercises splitByCells() for the engine test.
+// ARGS.seedSplit = { items, cells }; returns the contiguous groups.
+const seedSplit = ARGS.seedSplit
+if (seedSplit) {
+  phase('Analyze')
+  const groups = splitByCells(seedSplit.items, seedSplit.cells)
+  log(`seed-split mode: ${groups.length} group(s) for ${seedSplit.cells} cell(s)`)
+  return { groups, cellsPerAgent: CELLS_PER_AGENT, maxFillAgents: MAX_FILL_AGENTS, seedMode: true }
+}
+
+// SEED-ASSEMBLE MODE — exercises assemble() (axis coding + cell landing + precondition rows
+// seeded from object copies) for the engine test. ARGS.seedAssemble = { cols, seams, dim, cells }.
+const seedAssemble = ARGS.seedAssemble
+if (seedAssemble) {
+  phase('Analyze')
+  const s = seedAssemble
+  const draft0 = assemble(s.cols || {}, s.seams || {}, s.dim || {}, s.cells || {})
+  log(`seed-assemble mode: ${draft0.matrix.states.length} state(s) x ${draft0.matrix.columns.length} column(s), ${draft0.precondition.length} precondition row(s)`)
+  return { draft: draft0, seedMode: true }
+}
+
+// SEED-ROLES MODE — exposes the EFFECTIVE routing (tier, per-role model/effort after
+// ARGS.full / ARGS.models / ARGS.roles, refuter count and lens set) without calling a single
+// agent, so a benchmark arm is assertable in the engine test instead of in a live run.
+// ARGS.seedRoles = true.
+const seedRoles = ARGS.seedRoles
+if (seedRoles) {
+  phase('Enumerate')
+  log(`seed-roles mode: tier=${TIER}, ${REFUTERS_PER_ROUND} refuter(s), ${ACTIVE_LENSES.length} lens(es)`)
+  return { tier: TIER, roles: effectiveRoles(), refuters: REFUTERS_PER_ROUND, lenses: ACTIVE_LENSES, seedMode: true }
+}
 
 // =====================================================================
-// PHASE 2 — ANALYZE: dimension table + matrix cells (needs columns) + premises
+// PHASES 1+2 — ENUMERATE ∥ ANALYZE, one `parallel`. Only the matrix cells depend on another
+// agent's output (agent 2's columns), so they are chained INSIDE that thunk; the seam map, the
+// dimension table and the premise/test obligations depend on the intent alone and start at
+// t=0. Every agent carries an explicit `phase` so the two progress groups do not race on the
+// global phase() state while they overlap in time.
 // =====================================================================
-phase('Analyze')
-const columnList = (cols.columns || []).map(c => c.name).join(', ')
-const stateList = (cols.states || []).join(', ')
-const [dim, cellsOut, premOut] = await parallel([
-  () => agent(ctx('dimension-table.md'), { label: 'analyze:dimension-table', phase: 'Analyze', schema: DIMENSION_TABLE, ...role('a1'), agentType: 'general-purpose' }),
-  () => agent(
-    ctx('lifecycle-matrix.md') + `\n\n=== MATRIX TO FILL ===\nStates (rows): ${stateList}\nColumns: ${columnList}\nAnswer EVERY (state x column) cell handled/N·A/GAP. Column sites:\n` + (cols.columns || []).map(c => `- ${c.name} @ ${c.site} (reads ${c.reads})`).join('\n'),
-    { label: 'analyze:matrix-cells', phase: 'Analyze', schema: MATRIX_CELLS, ...role('a4'), agentType: 'general-purpose' },
-  ),
-  () => agent(ctx('test-coverage.md'), { label: 'analyze:premises-tests', phase: 'Analyze', schema: PREMISE_OBLIGATIONS, ...role('a5'), agentType: 'general-purpose' }),
+phase('Enumerate')
+log(`tier=${TIER} refuters=${REFUTERS_PER_ROUND} roles=${JSON.stringify(effectiveRoles())}`)
+
+// Agent 4 sharded by matrix ROW: each agent answers the whole row of the states it is given,
+// sized by CELLS (splitByCells) rather than one agent per state — the per-agent fixed cost
+// dominates. A single agent over the full cartesian left 22–60 % of the grid empty, which an
+// expensive serial fill then re-did. A dropped shard is LOGGED: a silent cap reads as "covered
+// everything" when it did not.
+async function fillCellsByRow(c, columnLines) {
+  const groups = splitByCells(c.states || [], (c.states || []).length * (c.columns || []).length)
+  const shards = await parallel(groups.map((states, i) => () => agent(
+    ctx('lifecycle-matrix.md', `analyze:cells-${i + 1}`)
+      + `\n\n=== MATRIX ROWS TO FILL (${states.length} state(s)) ===\n` + states.map(s => `- State (row): ${s}`).join('\n')
+      + `\nColumns:\n${columnLines}\n`
+      + `Answer EVERY column for EACH listed state — handled (with where) / N·A (with justification) / GAP (with justification). Every field <= 240 chars. Write each cell's \`state\` and \`column\` EXACTLY as listed (they begin with a code such as S3 / C12 — the code alone is enough); never paraphrase a label.`,
+    { label: `analyze:cells-${i + 1}`, phase: 'Analyze', schema: MATRIX_CELLS, ...role('a4'), agentType: 'general-purpose' },
+  )))
+  const cells = []
+  shards.forEach((sh, i) => {
+    if (sh) cells.push(...(sh.cells || []))
+    else log(`  matrix row shard ${i + 1} ([${groups[i].join(' | ')}]) returned nothing — its cells fall through to the targeted fill.`)
+  })
+  return { cells }
+}
+
+const columnLine = (c) => `- ${c.name} @ ${c.site} (reads ${c.reads})`
+const [colsAndCells, seams, dim, premOut] = await parallel([
+  () => agent(ctx('matrix-columns.md', 'enumerate:matrix-columns'), { label: 'enumerate:matrix-columns', phase: 'Enumerate', schema: MATRIX_COLUMNS, ...role('a2'), agentType: 'general-purpose' })
+    .then((c) => {
+      if (!c) return null
+      // Matrix discipline: keep only columns citing a concrete seam (file:line / source file)
+      // so the matrix stays dense — a column without one bloats the grid and leaves empty
+      // cells. A genuinely-missing interaction is re-added by a refuter WITH a site.
+      const { kept, dropped } = columnsWithSeam(c.columns)
+      c.columns = kept
+      // Code the axes NOW so every downstream agent (shards, refuters, fills) sees `S3 …` /
+      // `C12 …` and cells key by code, never by free text an agent may paraphrase.
+      c.states = codeAxes(c.states, 'S')
+      c.columns.forEach((col, i) => { col.name = AXIS_CODE_RE.test(col.name) ? col.name : `C${i + 1} ${col.name}` })
+      log(`Enumerated ${kept.length} matrix columns (dropped ${dropped.length} lacking a concrete seam), ${(c.states || []).length} new states.`)
+      if (dropped.length) log(`  pruned columns (no file:line): ${dropped.map(x => x.name).join(', ')}`)
+      return fillCellsByRow(c, kept.map(columnLine).join('\n')).then((cells) => ({ cols: c, cells }))
+    }),
+  () => agent(ctx('state-mutation-seams.md', 'enumerate:state-mutation-seams'), { label: 'enumerate:state-mutation-seams', phase: 'Enumerate', schema: SETTLEMENT_SEAMS, ...role('a3'), agentType: 'general-purpose' }),
+  () => agent(ctx('dimension-table.md', 'analyze:dimension-table'), { label: 'analyze:dimension-table', phase: 'Analyze', schema: DIMENSION_TABLE, ...role('a1'), agentType: 'general-purpose' }),
+  () => agent(ctx('test-coverage.md', 'analyze:premises-tests'), { label: 'analyze:premises-tests', phase: 'Analyze', schema: PREMISE_OBLIGATIONS, ...role('a5'), agentType: 'general-purpose' }),
 ])
+const cols = colsAndCells && colsAndCells.cols
+const cellsOut = colsAndCells && colsAndCells.cells
+if (!cols || !seams) throw new Error('Enumerate phase failed — matrix columns or state-mutation seams missing.')
 if (!dim || !cellsOut || !premOut) throw new Error('Analyze phase failed — a specialist slice is missing.')
+log(`Enumerated ${(seams.copiedGuards || []).length} copied guard(s).`)
 
 let draft = assemble(cols, seams, dim, cellsOut)
 draft.premises = premOut.premises || []
-canonicalizeMatrixStates(draft) // collapse any verbose/terse state drift before the fill keys off it
+// Contract block, folded deterministically: agent 5's own commitments plus one line per
+// failing-first test obligation. A prompt used to ask an agent for this fold, and dropped items.
+draft.contract = [
+  ...(premOut.contract || []),
+  ...(premOut.tests || []).map(t => `Failing-first test [${t.level}]: ${t.scenario} — catches ${t.catches}`),
+]
+canonicalizeMatrixStates(draft) // collapse any verbose/terse state drift before missingCells keys off it
 
-// Fill pass: turn the raw assembly into a complete draft (fill precondition
-// rows, ensure every state x column cell exists). Same resolver agent used in
-// the refute loop, with a fill instruction.
-function resolverPrompt(d, task, extra, patchMode) {
-  return [
-    `You are the deep-plan RESOLVER. ${task}`,
-    patchMode
-      ? `Return ONLY a PATCH (schema DRAFT_PATCH) — emit just the cells/rows/premises/columns/contract items you ADD or CHANGE. Unchanged content is merged in automatically; do NOT re-emit the whole draft (re-emitting the growing draft is what crashes the run on the 64k output-token limit and silently drops findings). Key exactly so the merge lands: a cell by (state,column) in \`cellsUpsert\`; a dimension row by \`variable\` in \`dimensionRowsUpsert\`; a premise by its text in \`premisesUpsert\`; a precondition row by (guard,copy) in \`preconditionUpsert\`. Reopen a handled cell by emitting it in \`cellsUpsert\` with verdict GAP. Resolve a load-bearing premise via \`premisesUpsert\` (seam + failingTest). Resolve a dimension violation via \`violationsResolved\` [{variable, resolution}] and/or the fixed row in \`dimensionRowsUpsert\`. Add a new column in \`columnsAdd\` AND its cells in \`cellsUpsert\`.`
-      : `Return the FULL updated draft (schema-validated). Preserve everything correct; only amend what the task requires.`,
-    `TERSENESS IS MANDATORY — an over-long output crashes serialization (the StructuredOutput call returns nothing and the whole run is wasted). Every field: file:line + one clause, <= 240 chars, no paragraphs, no quoting the intent back. Do not pad.`,
-    `CONTAMINATION GUARD: the DESIGN INTENT below is the only source of truth. Ignore any plan-contract/\`deep-plan-*.md\`/cached JSON you might have seen on disk — never let it reshape this draft toward another feature.`,
-    `A require/check seam is an executable assertion at the boundary, written in this repo's language and idiom (read \`docs/agents/skills-config.md\` › Stack if unsure) — the rule is stack-agnostic; the assertion form is just the local idiom.`,
-    `Rules: every (state x column) cell must exist and be handled (with \`where\`) / N·A (with \`justification\`) / GAP (with \`justification\`). Fill every precondition row's oldPrecondition/newReality/resolution (all three non-empty), and preserve each row's \`guard\` field VERBATIM so it keeps matching the guard predicate. Resolve dimension violations by adding cap+seam and moving them out of \`violations\`. You MAY add columns/cells/rows; never delete a real GAP by relabeling it handled without evidence.`,
-    ``,
-    `=== DESIGN INTENT ===`,
-    intent,
-    `=== CURRENT DRAFT (JSON) ===`,
-    JSON.stringify(d),
-    extra ? `\n=== ${extra.title} ===\n${extra.body}` : ``,
-    ``,
-    `Guard copies that each need a precondition row: ` + (seams.copiedGuards || []).map(g => `\`${g.predicate}\` (${(g.copies || []).length} copies: ${(g.copies || []).join(', ')})`).join('; '),
-    `Failing-first test obligations to fold into \`contract\`: ` + (premOut.tests || []).map(t => `${t.scenario} [${t.level}]`).join('; '),
-  ].join('\n')
+// Targeted fill: ONE agent over exactly the pairs the row shards left empty. There is no
+// separate expensive resolver hop any more — the shards own the grid, the gate owns the rest.
+const stillMissing = missingCells(draft)
+let targetedFilled = 0
+if (stillMissing.length) {
+  const fill = await agent(
+    ctx('lifecycle-matrix.md', 'analyze:cells-fill')
+      + `\n\n=== MISSING CELLS TO FILL (${stillMissing.length}) ===\n`
+      + stillMissing.map(m => `- [${m.state}] x [${m.column}]`).join('\n')
+      + `\n\nColumn sites:\n${(cols.columns || []).map(columnLine).join('\n')}\n`
+      + `Answer ONLY these pairs — handled (with where) / N·A (with justification) / GAP (with justification). Write each cell's \`state\` and \`column\` EXACTLY as listed (the leading S#/C# code alone is enough); never paraphrase a label. Every field <= 240 chars.`,
+    { label: 'analyze:cells-fill', phase: 'Analyze', schema: MATRIX_CELLS, ...role('a4'), agentType: 'general-purpose' },
+  )
+  if (fill) {
+    targetedFilled = (fill.cells || []).length
+    // Conservative: the fill was asked ONLY for the missing pairs; a stray answer for an
+    // existing pair must not bury a row shard's GAP.
+    draft = applyPatch(draft, { cellsUpsert: fill.cells || [] }, { conservative: true })
+  }
 }
-
-// LEVER 1 — the fill no longer re-emits the matrix. Agent 4 (analyze:matrix-cells)
-// already answered every (state×column) cell into the draft via assemble(); re-emitting
-// all N cells as one full DRAFT was the run's long pole (~35 min on a 28×14 matrix)
-// AND flirted with the StructuredOutput-returns-nothing crash. The fill now returns a
-// PATCH that does exactly three things: fills every precondition row, derives the
-// Contract block, and fills ONLY the cells the deterministic check still reports missing.
-// Existing cells are trusted (gate + refuters validate them); cartesian completeness is
-// enforced by the gate, not by costly full re-emission.
-const fillMissing = missingCells(draft)
-const filled = await agent(
-  resolverPrompt(
-    draft,
-    `Complete the draft. The matrix cells are ALREADY filled by the matrix specialist — do NOT re-emit existing cells. Do exactly three things: (1) fill EVERY precondition row (oldPrecondition/newReality/resolution all non-empty; preserve each \`guard\` VERBATIM) via \`preconditionUpsert\`; (2) derive the Contract block (wiring counts, predicates, invariants, exact values, files) from the intent and the slices, into \`contractAdd\`; (3) fill ONLY these still-missing cells via \`cellsUpsert\`${fillMissing.length ? ` (${fillMissing.length}): ` + fillMissing.map(m => `[${m.state}] x [${m.column}]`).join('; ') : ' — none, the matrix is already complete, so emit no cells'}.`,
-    null,
-    true,
-  ),
-  { label: 'analyze:fill', phase: 'Analyze', schema: DRAFT_PATCH, ...role('resolver'), agentType: 'general-purpose' },
-)
-if (filled) draft = applyPatch(draft, filled)
+log(`Matrix: ${(cols.states || []).length} states x ${(cols.columns || []).length} columns; shards filled ${(cellsOut.cells || []).length} cells; targeted fill filled ${targetedFilled} of ${stillMissing.length} missing`)
 
 // =====================================================================
-// PHASE 3 — REFUTE: anchoring-free lensed refuters, ONE round by default. Each
-// fresh refutation reopens a cell/row and the resolver integrates it.
+// PHASE 3 — REFUTE: anchoring-free lensed refuters in breadth, ONE round by default. Each
+// refuter emits its OWN reopening patch — whoever holds the evidence writes the reopening —
+// and the patches merge conservatively (GAP wins). There is no resolver hop.
 // =====================================================================
 phase('Refute')
-log(`tier=${TIER} roles=${JSON.stringify(ROLE)}`)
 const seen = new Set()
 let round = 0
 let lastRoundFresh = 0 // fresh refutations in the final executed round — feeds the convergence verdict
 const freshByRound = [] // fresh count per round — the trajectory shape (FLAT vs DECAYING) renderVerdict reports
 // Per-round decomposition of fresh into resolution-attacks vs new-surface. A run's
 // FLAT [30,25,23] decomposed to ~11/16 refutations attacking RESOLUTIONS minted by earlier
-// rounds — the loop is GENERATIVE (each resolver patch mints new attack surface), not
+// rounds — the loop is GENERATIVE (each reopening patch mints new attack surface), not
 // re-sampling an unexplored original surface. The mix is what tells the planner which.
 const freshMixByRound = []
 while (round < REFUTE_ROUNDS) {
@@ -1272,15 +1548,20 @@ while (round < REFUTE_ROUNDS) {
     Array.from({ length: REFUTERS_PER_ROUND }, (_, i) => () =>
       agent(
         [
-          `Read \`.claude/skills/deep-plan/agents/refuter.md\` and operate as the refuter for round ${round}. Your assigned attack LENS #${i + 1}: ${REFUTER_LENSES[i % REFUTER_LENSES.length]}`,
+          `[deep-plan role: refute:r${round}-${i + 1}]`,
+          `Read \`.claude/skills/deep-plan/agents/refuter.md\` and operate as the refuter for round ${round}. Your assigned attack LENS #${i + 1}: ${ACTIVE_LENSES[i % ACTIVE_LENSES.length]}`,
           `LEAD with that lens; the other refuters this round cover the other lenses, so do not duplicate their angle. If your lens is genuinely exhausted, attack any cell/row no other refuter would.`,
           `You see ONLY the draft below and the design intent — NOT the reasoning that produced them. Verify against the live codebase with \`rg\` (NEVER \`grep -r\`), scoped INSIDE this repo root \`${repoRoot}\` only — never /tmp, .., ~, or sibling worktrees. One simple command per Bash call.`,
           `CONTAMINATION GUARD: the intent below is the only source of truth; ignore any plan-contract/\`deep-plan-*.md\`/cached JSON on disk. Keep every field terse (file:line + one clause, <= 240 chars).`,
-          `Also read your independent reference (paths from \`docs/agents/skills-config.md\` › Docs layout; default \`docs/planning/recurring-failure-modes.md\`, \`docs/CORE_TENETS.md\`, and the affected-domain premises).`,
+          ``,
+          ...readingList(),
           ``,
           `ALREADY-OPEN items (the draft already marks these GAP/unresolved — do NOT spend your attack merely re-raising one of these on another cell; that is noise the dedup discards): ${knownOpen || '(none yet)'}.`,
           `Spend your attack on one of: (a) a cell currently marked handled/N·A that is actually wrong; (b) refuting the RESOLUTION of an already-open item — show the proposed fix is itself broken (e.g. a post-commit-propagation "fix" was shown to ORPHAN the new record); (c) a NEW column/state the matrix is missing entirely.`,
           `Tag each refutation's \`attacks\` field honestly: 'resolution' when it breaks a fill/fix the draft already contains (surfaces (a)/(b)); 'new-surface' when it names territory the draft lacks (surface (c)). The verdict reports this mix — it is how the planner distinguishes fix-attack equilibrium from undiscovered surface.`,
+          ``,
+          `Reference every EXISTING cell by its axis labels exactly as printed in the draft (the leading S#/C# code alone is enough; never paraphrase). A column/state you ADD needs no code — the engine assigns one.`,
+          `Return your reopening as \`patch\` (schema DRAFT_PATCH) — you hold the evidence, so you write the reopening; no agent integrates it after you. \`cellsUpsert\` with verdict GAP + justification for every cell you refute; when you name a missing column/state, \`columnsAdd\`/\`statesAdd\` AND \`cellsUpsert\` for EVERY existing state x that column (handled/N·A/GAP with evidence); \`violationsAdd\`/\`dimensionRowsUpsert\` for dimension attacks; \`preconditionUpsert\` for a precondition shown false (\`guard\` VERBATIM); \`contractAdd\` for a missing commitment. REOPEN ONLY — never propose a fix, never relabel a GAP as handled.`,
           ``,
           `=== DESIGN INTENT ===`,
           intent,
@@ -1306,39 +1587,108 @@ while (round < REFUTE_ROUNDS) {
     }
   }
 
+  // The trajectory metrics are computed BEFORE any merge, so `fresh` keeps measuring new
+  // information against the draft the refuters actually saw.
   lastRoundFresh = fresh.length
   freshByRound.push(fresh.length)
   const mixResolution = fresh.filter((r) => r.attacks === 'resolution').length
   freshMixByRound.push({ resolution: mixResolution, newSurface: fresh.length - mixResolution })
-  if (!fresh.length) {
-    log(`Refute round ${round}: no fresh refutation.`)
-    continue
+
+  // Merge each refuter's own reopening patch, in order, CONSERVATIVELY: a cell two refuters
+  // both touch resolves through mergeCell (GAP wins), so the last patch applied cannot bury
+  // an earlier reopening.
+  let patched = 0
+  for (const verdict of verdicts) {
+    if (!verdict.patch) continue
+    patched++
+    draft = applyPatch(draft, verdict.patch, { conservative: true })
   }
-  log(`Refute round ${round}: ${fresh.length} fresh refutation(s) — reopening cells/rows.`)
-  const resolved = await agent(
-    resolverPrompt(draft, 'Integrate the refutations below: add any missing matrix column AND fill its cells, reopen wrongly-handled cells (set to GAP with justification, or fix to handled WITH evidence/where), fix dimension violations, and amend precondition rows whose precondition is shown false.', { title: 'REFUTATIONS TO RESOLVE', body: fresh.map(r => `- [${r.surface}] ${r.target}: ${r.scenario} (forces: ${r.forces})`).join('\n') }, true),
-    { label: `refute:resolve-r${round}`, phase: 'Refute', schema: DRAFT_PATCH, ...role('resolver'), agentType: 'general-purpose' },
-  )
-  if (resolved) draft = applyPatch(draft, resolved)
+  // A named missing column that no patch declared still becomes an axis, so its empty pairs
+  // surface in missingCells and get filled by the gate's per-column pass.
+  for (const verdict of verdicts) {
+    for (const mc of (verdict.missingColumns || [])) {
+      if (!mc || !mc.site) continue
+      if (resolveAxis(mc.site, draft.matrix.columns) !== null) continue
+      draft = applyPatch(draft, { columnsAdd: [`${mc.site} (reads ${mc.reads || 'the affected state'})`] })
+    }
+  }
+  log(`Refute round ${round}: ${fresh.length} fresh refutation(s); ${patched}/${verdicts.length} refuter patch(es) merged.`)
 }
 log(`Refute ended after ${round} round(s).`)
 
+// The only LLM step left in the gate: a patch for the violations a per-column fill cannot
+// close (unjustified GAPs, non-executable premises, dimension violations, unfilled
+// precondition rows), with any residual empty pairs as a fallback. Patch-only — re-emitting
+// the growing draft is what crashed a run on the 64k output-token ceiling.
+function justifyPrompt(label, d, viols, residualEmpties) {
+  return [
+    `[deep-plan role: ${label}]`,
+    `You are the deep-plan GATE JUSTIFIER. The programmatic gate found the violations below. Resolve each: give every GAP a written justification, make every load-bearing premise executable (a require/check seam + a failing-first test), resolve dimension violations by adding cap+seam, and complete every per-copy precondition row (oldPrecondition/newReality/resolution all non-empty, \`guard\` VERBATIM so it keeps matching the predicate). A GAP you cannot close must carry an explicit written justification; never delete a real GAP by relabeling it handled without evidence.`,
+    `Return ONLY a PATCH (schema DRAFT_PATCH) — emit just the cells/rows/premises/columns/contract items you ADD or CHANGE. Unchanged content is merged in automatically; do NOT re-emit the whole draft. Key exactly so the merge lands: a cell by (state,column) in \`cellsUpsert\`; a dimension row by \`variable\` in \`dimensionRowsUpsert\`; a premise by its text in \`premisesUpsert\`; a precondition row by (guard,copy) in \`preconditionUpsert\`; a dimension violation via \`violationsResolved\` [{variable, resolution}].`,
+    `A require/check seam is an executable assertion at the boundary, written in this repo's language and idiom (read \`docs/agents/skills-config.md\` › Stack if unsure) — the rule is stack-agnostic; the assertion form is just the local idiom.`,
+    `TERSENESS IS MANDATORY — an over-long output crashes serialization (the StructuredOutput call returns nothing and the whole run is wasted). Every field: file:line + one clause, <= 240 chars, no paragraphs, no quoting the intent back. Do not pad.`,
+    `CONTAMINATION GUARD: the DESIGN INTENT below is the only source of truth. Ignore any plan-contract/\`deep-plan-*.md\`/cached JSON you might have seen on disk — never let it reshape this draft toward another feature.`,
+    ``,
+    `=== DESIGN INTENT ===`,
+    intent,
+    `=== CURRENT DRAFT (JSON) ===`,
+    JSON.stringify(d),
+    `=== GATE VIOLATIONS ===`,
+    viols.map(x => `- ${x.kind}: ${x.detail}`).join('\n') || '(none)',
+    residualEmpties.length ? `=== EMPTY CELLS STILL UNFILLED (answer every one) ===\n` + residualEmpties.map(m => `- [${m.state}] x [${m.column}]`).join('\n') : ``,
+    ``,
+    `Guard copies that each need a precondition row: ` + (seams.copiedGuards || []).map(g => `\`${g.predicate}\` (${(g.copies || []).length} copies: ${(g.copies || []).map(copyOf).join(', ')})`).join('; '),
+  ].join('\n')
+}
+
 // =====================================================================
-// PHASE 4 — GATE: programmatic completeness. A bounded justify loop, each pass fed the
-// deterministic missing-cell list so a matrix grown by a refuter gets its whole new
-// row/column filled (not just the cell the refuter named). A residual after the loop is
-// RECORDED, never thrown — deep-plan never blocks (SKILL.md Phase 7).
+// PHASE 4 — GATE: programmatic completeness. The refuters grow the matrix, so the empty pairs
+// are filled FIRST — cheap agents, batched by column and sized by cells, in parallel — and the
+// bounded justify loop then only sees what a fill cannot close. A residual after the loop is
+// RECORDED, never thrown — deep-plan never blocks (SKILL.md Phase 6).
 // =====================================================================
 phase('Gate')
+const empties = missingCells(draft)
+if (empties.length) {
+  const byColumn = new Map()
+  for (const m of empties) {
+    const k = normCode(m.column)
+    if (!byColumn.has(k)) byColumn.set(k, { column: m.column, states: [] })
+    byColumn.get(k).states.push(m.state)
+  }
+  const groups = splitByCells([...byColumn.values()], empties.length)
+  const colMeta = new Map((cols.columns || []).map(c => [normCode(c.name), c]))
+  log(`Gate: ${empties.length} empty grid cell(s) across ${byColumn.size} column(s) — ${groups.length} fill agent(s) of ~${CELLS_PER_AGENT} cells, in parallel.`)
+  // The fill gets the states and the column seams, NOT the whole draftSummary: the summary is
+  // the single largest per-agent cost here and the column's cells do not exist yet, so it
+  // bought nothing.
+  const fills = await parallel(groups.map((batch, i) => () => agent(
+    ctx('lifecycle-matrix.md', `gate:fill-${i + 1}`)
+      + `\n\n=== MATRIX COLUMNS TO FILL (${batch.length}) ===\n`
+      + batch.map((g) => {
+        const meta = colMeta.get(normCode(g.column))
+        return `Column: ${g.column}\n  site: ${meta ? `${meta.site} (reads ${meta.reads})` : 'the site named in the column label'}\n  states (rows) still unanswered:\n` + g.states.map(s => `  - ${s}`).join('\n')
+      }).join('\n')
+      + `\n\nAnswer EVERY listed state of EACH column — handled (with where) / N·A (with justification) / GAP (with justification). Write each cell's \`state\` and \`column\` EXACTLY as listed (the leading S#/C# code alone is enough); never paraphrase a label. Every field <= 240 chars.`,
+    { label: `gate:fill-${i + 1}`, phase: 'Gate', schema: MATRIX_CELLS, ...role('a4'), agentType: 'general-purpose' },
+  )))
+  fills.forEach((f, i) => {
+    // Conservative: this runs AFTER the refuters, so a fill answer for an already-filled pair
+    // must never overwrite a refuter's reopening (GAP wins).
+    if (f) draft = applyPatch(draft, { cellsUpsert: f.cells || [] }, { conservative: true })
+    else log(`  gate fill batch ${i + 1} ([${groups[i].map(g => g.column).join(' | ')}]) returned nothing — its cells stay empty for the justify pass.`)
+  })
+}
 let { pass, violations } = gateCheck(draft, seams.copiedGuards)
 let gateRound = 0
 while (!pass && gateRound < GATE_JUSTIFY_ROUNDS) {
   gateRound++
-  const empties = missingCells(draft)
-  log(`Gate: ${violations.length} violation(s)${empties.length ? `, ${empties.length} empty grid cell(s)` : ''} — justify pass ${gateRound}/${GATE_JUSTIFY_ROUNDS}.`)
+  const residualEmpties = missingCells(draft)
+  const nonCellViolations = violations.filter(x => x.kind !== 'empty-cell')
+  log(`Gate: ${violations.length} violation(s)${residualEmpties.length ? `, ${residualEmpties.length} empty grid cell(s) the column fills did not close` : ''} — justify pass ${gateRound}/${GATE_JUSTIFY_ROUNDS}.`)
   const justified = await agent(
-    resolverPrompt(draft, 'The gate found the violations below. Resolve each: fill EVERY empty cell listed (a matrix grown by a refuter leaves new state×column pairs blank — fill ALL of them, not only ones a refuter named), give every GAP a written justification, make every load-bearing premise executable (seam + failing-first test), resolve dimension violations, and complete every per-copy precondition row. A GAP you cannot close must carry an explicit written justification.', { title: 'GATE VIOLATIONS', body: violations.map(x => `- ${x.kind}: ${x.detail}`).join('\n') + (empties.length ? `\n\nEMPTY CELLS TO FILL (every one):\n` + empties.map(m => `- [${m.state}] x [${m.column}]`).join('\n') : '') }, true),
-    { label: `gate:justify-${gateRound}`, phase: 'Gate', schema: DRAFT_PATCH, ...role('resolver'), agentType: 'general-purpose' },
+    justifyPrompt(`gate:justify-${gateRound}`, draft, nonCellViolations, residualEmpties),
+    { label: `gate:justify-${gateRound}`, phase: 'Gate', schema: DRAFT_PATCH, ...role('justify'), agentType: 'general-purpose' },
   )
   if (justified) draft = applyPatch(draft, justified)
   ;({ pass, violations } = gateCheck(draft, seams.copiedGuards))
@@ -1347,7 +1697,7 @@ log(`Gate: ${pass ? 'PASS' : 'FAIL'} (${violations.length} residual violation(s)
 // A residual-GAP run is NOT fatal. A run threw here and lost ~3M tokens / 2h:
 // a refuter grew the matrix, the single justify pass left new cartesian pairs empty, and
 // the throw nuked the run before synthesize ever ran. deep-plan never blocks (SKILL.md
-// Phase 7) — surface residual GAPs in the result (gate:FAIL + residualGaps + the ⚠️
+// Phase 6) — surface residual GAPs in the result (gate:FAIL + residualGaps + the ⚠️
 // Unresolved block renderVerdict emits) and STILL synthesize; a flagged contract is
 // incomparably more useful than a 0-byte output. (Seed mode keeps its own throw for the
 // gate-detects-incompleteness test; `noThrow` there returns the violation list instead.)
@@ -1374,6 +1724,7 @@ const artifacts = renderArtifacts(draft)
 const watchSeams = sharedSeams(draft)
 const narrative = stripPreamble(await agent(
   [
+    `[deep-plan role: synthesize:consolidate]`,
     `Read \`.claude/skills/deep-plan/agents/consolidate.md\` and operate as the consolidator.`,
     `The verdict header and the four structured artifacts (Contract, interaction matrix, dimension table, precondition diff, premises) are rendered DETERMINISTICALLY by the engine — do NOT reproduce them, do NOT write a title or any "## Contract"/matrix/table. Your job is the NARRATIVE SYNTHESIS only.`,
     `Cluster the GAP cells and refutations into the handful of THEMES / likely BLOCKERs the planner must decide, in priority order; each theme cites the file:line it turns on and the decision required. Do NOT re-soften any GAP. The gate verdict is fixed: ${pass ? 'PASS' : 'FAIL'} with ${violations.length} residual GAP(s).`,
@@ -1421,6 +1772,8 @@ if (omissions.length || coverage.buried.length || coverage.missingBlock || struc
 
 return {
   gate: pass ? 'PASS' : 'FAIL',
+  tier: TIER,
+  roles: effectiveRoles(),
   residualGaps: violations.length,
   violations,
   contract: draft,

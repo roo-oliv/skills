@@ -329,8 +329,18 @@ emits nothing. That is why there is no "disable telemetry in CI" step.
 |---|---|
 | **Cost per PR** | `cost.usage` ÷ `pull_request.count` |
 | **Share of tokens in subagents** | `token.usage{query_source:subagent}` ÷ `token.usage` |
-| **Cost per skill** | `cost.usage` grouped by `skill.name` |
+| **Cost per skill** | `cost.usage` grouped by `skill.name` — but see the Workflow caveat below |
 | **Model × effort** | `cost.usage` and `token.usage` grouped by `model,effort` — the pair the role tiering is calibrated on |
+| **Cost of one workflow run** | not from here — `ci/wf_timeline.py` over the run journal (below) |
+
+**Cost per skill does not see a Workflow's subagents.** They arrive tagged with a generic agent
+type and no `skill.name`, so a `cost.usage{skill.name:deep-plan}` widget only ever reports the main
+thread — under a dollar a run, next to run journals showing tens of millions of cache-read tokens
+for the same runs. For a `deep-plan` or `implement` run, the instrument is
+`ci/wf_timeline.py <wf_dir> --stages` (vendored to `.github/scripts/`), which reads
+`~/.claude/projects/<project>/<session>/subagents/workflows/wf_*` and reports wall-clock, turns and
+tokens **per agent and per stage**, each stage with its window. See
+[`workflow-calibration.md`](workflow-calibration.md).
 
 Attributes worth knowing, verified on a real session:
 
